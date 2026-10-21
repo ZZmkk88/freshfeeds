@@ -24,6 +24,13 @@
 - P2-5（README 数据库路径表述）：已修，写明路径相对 app.py 所在目录。
 - P2-6（httpx 的 Starlette 弃用警告）：**不修**。任务不许改依赖版本号，且警告无害、不影响功能。
 
+## TASK-063（OPML 导入 htmlUrl 清洗）
+
+- P1-1：采纳并手工搬运。OPML 导入路径的 `htmlUrl` 之前不经 `_clean_url`，`javascript:` 会直接写入 `feeds.site_url` 并在导出时原样写回。TASK-057 的 95df330 只清了解析路径（抓取刷新）的 site_url，导入路径是真新增量、不是重复。修法：`_clean_url(o.get("htmlUrl") or "")`。
+- 回归测试：导入 `htmlUrl="javascript:…"` 入库为空串、正常 https htmlUrl 保留、导出 OPML 无 `javascript:`。测试 30→31。
+- P2-5（强制改密）：按本文件第 7-10 行"永久不采纳"关闭（口径第 1 条）。
+- P2-6/P2-7/P2-8：按红线（不改测试、不改依赖版本）不动；fec0::/10、文档用地址段、注销接口、userinfo 拒绝维持。
+
 ## TASK-060（密码长度上限＋P2 收尾）
 
 - P1-1（连接钉死/_open_pinned/忽略环境代理）、P1-2（IPv6 内嵌 IPv4 拆解）：与 TASK-057 已合入的实现同义重复，**不采纳**，Grok 分支整段不搬（其基座落后 main 4 个提交）。
