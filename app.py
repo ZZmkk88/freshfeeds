@@ -888,6 +888,7 @@ def list_entries(
         args += [f"%{kw}%", f"%{kw}%"]
     sql += " ORDER BY COALESCE(NULLIF(e.published_at,''), e.fetched_at) DESC LIMIT ? OFFSET ?"
     limit = max(1, min(limit, 200))  # P2-2：负数不能绕过上限
+    offset = max(0, offset)  # TASK-081 P2-12：负 offset 夹到 0（口径第 10 条）
     args += [limit, offset]
     conn = db()
     rows = conn.execute(sql, args).fetchall()
