@@ -534,3 +534,30 @@ def test_long_password_change_rejected(client):
                     json={"old_password": "admin123", "new_password": "short"}, headers=auth)
     assert r.status_code == 400
     assert "至少 6 位" in r.json()["detail"]
+
+
+def test_opml_import_htmlurl_javascript_blanked(client, monkeypatch):
+    """TASK-063：OPML 导入路径的 htmlUrl 同样过 _clean_url，javascript: 入库为空串。"""
+    auth = login(client)
+    opml = """<?xml version="1.0"?>
+    <opml version="2.0"><body>
+      <outline text="坏源" type="rss" xmlUrl="https://evil.example/rss" htmlUrl="javascript:alert(1)"/>
+      <outline text="好源" type="rss" xmlUrl="https://good.example/rss" htmlUrl="https://good.example/"/>
+    </body></opml>"""
+    no_ssrf(monkeypatch)
+    # 两个源都不在抓取映射里：refresh 失败只记 last_error，入库的 site_url 保持导入时的值
+    def boom(url, etag="", last_modified=""):
+        raise RuntimeError("no network in test")
+    monkeypatch.setattr(appmod, "fetch_url", boom)
+    r = client.post(
+        "/api/opml/import",
+        files={"file": ("x.opml", opml, "text/x-opml")},
+        headers=auth,
+    )
+    assert r.status_code == 200
+    assert r.json()["failed"] == 2
+    feeds = {f["url"]: f for f in client.get("/api/feeds", headers=auth).json()}
+    assert feeds["https://evil.example/rss"]["site_url"] == ""
+    assert feeds["https://good.example/rss"]["site_url"] == "https://good.example/"
+    exported = client.get("/api/opml/export", headers=auth).text
+    assert "javascript:" not in exported
