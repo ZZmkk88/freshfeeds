@@ -54,8 +54,9 @@ Linux/macOS 与 Windows 命令相同（Windows 在已激活 venv 的 PowerShell 
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `PORT` | `8000` | 监听端口（只监听 127.0.0.1） |
-| `FRESHFEEDS_DB` | `data/freshfeeds.db` | 数据库文件路径 |
+| `HOST` | `127.0.0.1` | 监听地址；只放内网/公网访问时显式改，放开前先改掉默认密码 |
+| `PORT` | `8000` | 监听端口 |
+| `FRESHFEEDS_DB` | `data/freshfeeds.db`（相对 app.py 所在目录） | 数据库文件路径 |
 | `FRESHFEEDS_REFRESH_MINUTES` | `30` | 定时刷新间隔（分钟） |
 | `FRESHFEEDS_SCHEDULER` | `1` | 设为 `0` 关闭定时刷新 |
 
