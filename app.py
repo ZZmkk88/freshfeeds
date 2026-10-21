@@ -74,14 +74,21 @@ def _addr_blocked(ip) -> bool:
 
 
 def _embedded_ipv4(ip: ipaddress.IPv6Address):
-    """过渡地址里夹着的 IPv4。6to4 / NAT64 / Teredo / 已废弃的 IPv4-compatible。"""
+    """过渡地址里夹着的 IPv4。6to4 / NAT64 / Teredo / 已废弃的 IPv4-compatible / SIIT。"""
     packed = int(ip)
+    raw = ip.packed
     if ip in ipaddress.ip_network("2002::/16"):
         return ipaddress.IPv4Address((packed >> 80) & 0xFFFFFFFF)
-    if ip in ipaddress.ip_network("64:ff9b::/96") or ip in ipaddress.ip_network("64:ff9b:1::/48"):
-        return ipaddress.IPv4Address(packed & 0xFFFFFFFF)
+    if ip in ipaddress.ip_network("64:ff9b::/96"):
+        return ipaddress.IPv4Address(raw[12:16])
+    # RFC 6052：/48 的内嵌 IPv4 在第 48–87 位，中间隔一个 u 字节；最后 32 位是后缀。
+    if ip in ipaddress.ip_network("64:ff9b:1::/48"):
+        return ipaddress.IPv4Address(raw[6:8] + raw[9:11])
     if ip in ipaddress.ip_network("2001::/32"):
         return ipaddress.IPv4Address((packed & 0xFFFFFFFF) ^ 0xFFFFFFFF)
+    # RFC 2765 SIIT：::ffff:0:a.b.c.d。映射地址 ::ffff:a.b.c.d 已在调用方转成 IPv4。
+    if ip in ipaddress.ip_network("::ffff:0:0:0/96"):
+        return ipaddress.IPv4Address(packed & 0xFFFFFFFF)
     # ::ffff:0:0/96 已在调用方转成 IPv4，不会进到这里。
     if ip.ipv4_mapped is None and packed >> 32 == 0:
         return ipaddress.IPv4Address(packed & 0xFFFFFFFF)
@@ -443,8 +450,13 @@ def _open_pinned(req, ips, timeout):
             socket.getaddrinfo = real
 
 
+def _escape_like(s: str) -> str:
+    """LIKE 通配符转义（dailymemo 先例）：% _ \\ 前加反斜杠，配合 ESCAPE '\\' 使用。"""
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def fetch_url(url: str, etag: str = "", last_modified: str = ""):
-    """返回 (status, text, etag, last_modified)。status: ok / not_modified。
+    """返回 (status, text, etag, last_modified, ctype)。status: ok / not_modified。
     重定向自己跟，每一跳都过 SSRF 校验；响应体超过 5MB 拒绝。"""
     current = url
     for _ in range(MAX_REDIRECTS + 1):
@@ -659,12 +671,15 @@ def refresh_feed(feed_id: int) -> dict:
                 conn.commit()
                 conn.close()
                 return {"added": 0, "not_modified": True}
+            found = ""
             if "html" in ctype and "<feed" not in text[:500].lower() and "<rss" not in text[:500].lower():
                 found = discover_feed_url(text, feed["url"])
                 if found and found != feed["url"]:
                     status, text, etag, lm, ctype = fetch_url(found)
-                    conn.execute("UPDATE feeds SET url = ? WHERE id = ?", (found, feed_id))
             title, site_url, entries = parse_feed(text)
+            # 解析成功才改订阅地址。失败分支会提交当前事务，不能提前 UPDATE。
+            if found and found != feed["url"]:
+                conn.execute("UPDATE feeds SET url = ? WHERE id = ?", (found, feed_id))
         except Exception as e:  # 网络/解析错误都记下来，不假装成功
             conn.execute(
                 "UPDATE feeds SET last_checked_at = ?, last_error = ? WHERE id = ?",
@@ -868,8 +883,9 @@ def list_entries(
         sql += " AND f.category_id = ?"
         args.append(category_id)
     if q.strip():
-        sql += " AND (e.title LIKE ? OR e.content LIKE ?)"
-        args += [f"%{q.strip()}%", f"%{q.strip()}%"]
+        kw = _escape_like(q.strip())  # P2-3：% _ 当字面关键词，不当 SQL 通配符
+        sql += " AND (e.title LIKE ? ESCAPE '\\' OR e.content LIKE ? ESCAPE '\\')"
+        args += [f"%{kw}%", f"%{kw}%"]
     sql += " ORDER BY COALESCE(NULLIF(e.published_at,''), e.fetched_at) DESC LIMIT ? OFFSET ?"
     limit = max(1, min(limit, 200))  # P2-2：负数不能绕过上限
     args += [limit, offset]
