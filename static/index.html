@@ -36,6 +36,7 @@
   .navitem.active { background:#e2f2ec; color:var(--teal-dark); font-weight:600; }
   .navitem .badge { background:var(--teal); color:#fff; font-size:11px; border-radius:10px; padding:1px 7px; }
   .navitem .del { color:#b3261e; border:none; background:none; padding:0 2px; font-size:13px; }
+  .navitem .refresh { color:var(--teal-dark); border:none; background:none; padding:0 4px; font-size:13px; }
   main { flex:1; padding:20px 26px; max-width:900px; }
   .toolbar { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:16px; }
   .toolbar .spacer { flex:1; }
@@ -175,7 +176,7 @@ async function loadSide() {
   document.getElementById('catList').innerHTML = cats.map(c =>
     `<div class="navitem ${curCat === c.id ? 'active' : ''}" onclick="pickFeed(0,${c.id})"><span>${esc(c.name)}（${c.feed_count} 源）</span><button class="del" title="删分类" onclick="event.stopPropagation();delCategory(${c.id})">✕</button></div>`).join('') || '<div style="color:var(--mut);font-size:13px">还没有分类</div>';
   document.getElementById('feedList').innerHTML = feeds.map(f =>
-    `<div class="navitem ${curFeed === f.id ? 'active' : ''}" onclick="pickFeed(${f.id},0)"><span title="${esc(f.last_error || f.url)}">${esc(f.title || f.url)}${f.last_error ? ' ⚠️' : ''}</span><span>${f.unread ? `<span class="badge">${f.unread}</span>` : ''}<button class="del" title="退订" onclick="event.stopPropagation();delFeed(${f.id})">✕</button></span></div>`).join('') || '<div style="color:var(--mut);font-size:13px">还没有订阅</div>';
+    `<div class="navitem ${curFeed === f.id ? 'active' : ''}" onclick="pickFeed(${f.id},0)"><span title="${esc(f.last_error || f.url)}">${esc(f.title || f.url)}${f.last_error ? ' ⚠️' : ''}</span><span>${f.unread ? `<span class="badge">${f.unread}</span>` : ''}<button class="refresh" title="刷新这个源" onclick="event.stopPropagation();refreshOne(${f.id})">⟳</button><button class="del" title="退订" onclick="event.stopPropagation();delFeed(${f.id})">✕</button></span></div>`).join('') || '<div style="color:var(--mut);font-size:13px">还没有订阅</div>';
 }
 function pickFeed(fid, cid) { curFeed = fid; curCat = cid; onlyUnread = false; loadSide(); loadEntries(); }
 function pickUnread() { curFeed = 0; curCat = 0; onlyUnread = true; loadSide(); loadEntries(); }
@@ -206,6 +207,16 @@ async function markRead(id, silent) { try { await api('/api/entries/' + id + '/s
 async function toggleRead(id, cur) { const next = cur === 'read' ? 'unread' : 'read'; await api('/api/entries/' + id + '/status', { method: 'PUT', body: JSON.stringify({ status: next }) }); loadEntries(); loadSide(); }
 async function markAllRead() { await api('/api/entries/mark-all-read?feed_id=' + curFeed + '&category_id=' + curCat, { method: 'POST' }); loadEntries(); loadSide(); }
 async function refreshAll() { const m = document.getElementById('feedMsg'); m.textContent = '正在刷新…'; const r = await api('/api/feeds/refresh-all', { method: 'POST' }); m.textContent = `刷新完：${r.feeds} 个源，新增 ${r.added} 篇，失败 ${r.failed} 个`; loadEntries(); loadSide(); }
+async function refreshOne(id) {
+  const m = document.getElementById('feedMsg');
+  m.textContent = '正在刷新…';
+  try {
+    const r = await api('/api/feeds/' + id + '/refresh', { method: 'POST' });
+    m.textContent = r.not_modified ? '这个源没有新内容' : ('这个源新增 ' + (r.added || 0) + ' 篇');
+    loadEntries();
+    loadSide();
+  } catch (e) { m.textContent = e.message; }
+}
 async function addFeed() {
   const url = document.getElementById('feedUrl').value.trim(), cat = document.getElementById('feedCat').value.trim();
   try {

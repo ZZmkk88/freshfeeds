@@ -344,8 +344,12 @@ def parse_feed(xml_text: str):
     site_url = _text(channel, "link")
     items = channel.findall("item")
     if not items and root.tag.endswith("RDF"):
-        items = root.findall("{http://purl.org/rss/1.0/}item")
         ns = "{http://purl.org/rss/1.0/}"
+        items = root.findall(ns + "item")
+        channel_el = root.find(ns + "channel")
+        if channel_el is not None:
+            title = _text(channel_el, ns + "title") or title
+            site_url = _text(channel_el, ns + "link") or site_url
         for it in items:
             add(
                 it.get("{http://www.w3.org/1999/02/22-rdf-syntax-ns#}about", ""),
@@ -531,8 +535,10 @@ def create_feed(body: FeedIn, user=Depends(current_user)):
         )
         conn.commit()
         fid = cur.lastrowid
-    except sqlite3.IntegrityError:
+    except sqlite3.IntegrityError as e:
         conn.close()
+        if "foreign key" in str(e).lower():
+            raise HTTPException(400, "分类不存在")
         raise HTTPException(400, "这个源已经订阅过了")
     conn.close()
     try:
@@ -593,7 +599,11 @@ def list_entries(
         sql += " AND (e.title LIKE ? OR e.content LIKE ?)"
         args += [f"%{q.strip()}%", f"%{q.strip()}%"]
     sql += " ORDER BY COALESCE(NULLIF(e.published_at,''), e.fetched_at) DESC LIMIT ? OFFSET ?"
-    args += [min(limit, 200), offset]
+    if limit < 1:
+        limit = 1
+    elif limit > 200:
+        limit = 200
+    args += [limit, offset]
     conn = db()
     rows = conn.execute(sql, args).fetchall()
     conn.close()
