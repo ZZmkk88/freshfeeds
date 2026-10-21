@@ -653,3 +653,12 @@ def test_search_like_escape(client, monkeypatch):
     assert [e["title"] for e in hits] == ["100%纯棉T恤"]
     assert client.get("/api/entries", params={"q": "_"}, headers=auth).json() == []
     assert len(client.get("/api/entries", params={"q": "纯棉"}, headers=auth).json()) == 2
+
+
+def test_offset_negative_clamped(client):
+    """TASK-081 P2-12：offset=-1 被夹到 0，不报错、结果与 offset=0 一致。"""
+    auth = login(client)
+    a = client.get("/api/entries", params={"offset": -1, "limit": 5}, headers=auth)
+    b = client.get("/api/entries", params={"offset": 0, "limit": 5}, headers=auth)
+    assert a.status_code == 200 == b.status_code
+    assert a.json() == b.json()
