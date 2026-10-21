@@ -7,6 +7,7 @@
 import hashlib
 import hmac
 import html
+import http.client
 import ipaddress
 import os
 import re
@@ -67,6 +68,25 @@ _BLOCKED_NETWORKS = [
 ]
 
 
+def _addr_blocked(ip) -> bool:
+    return any(ip in net for net in _BLOCKED_NETWORKS if net.version == ip.version)
+
+
+def _embedded_ipv4(ip: ipaddress.IPv6Address):
+    """过渡地址里夹着的 IPv4。6to4 / NAT64 / Teredo / 已废弃的 IPv4-compatible。"""
+    packed = int(ip)
+    if ip in ipaddress.ip_network("2002::/16"):
+        return ipaddress.IPv4Address((packed >> 80) & 0xFFFFFFFF)
+    if ip in ipaddress.ip_network("64:ff9b::/96") or ip in ipaddress.ip_network("64:ff9b:1::/48"):
+        return ipaddress.IPv4Address(packed & 0xFFFFFFFF)
+    if ip in ipaddress.ip_network("2001::/32"):
+        return ipaddress.IPv4Address((packed & 0xFFFFFFFF) ^ 0xFFFFFFFF)
+    # ::ffff:0:0/96 已在调用方转成 IPv4，不会进到这里。
+    if ip.ipv4_mapped is None and packed >> 32 == 0:
+        return ipaddress.IPv4Address(packed & 0xFFFFFFFF)
+    return None
+
+
 def _is_public_ip(ip_text: str) -> bool:
     try:
         ip = ipaddress.ip_address(ip_text)
@@ -74,25 +94,69 @@ def _is_public_ip(ip_text: str) -> bool:
         return False
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
         ip = ip.ipv4_mapped
-    return not any(ip in net for net in _BLOCKED_NETWORKS if net.version == ip.version)
+    if _addr_blocked(ip):
+        return False
+    if isinstance(ip, ipaddress.IPv6Address):
+        embedded = _embedded_ipv4(ip)
+        if embedded is not None and _addr_blocked(embedded):
+            return False
+    return True
 
 
-def ensure_fetch_allowed(url: str) -> None:
+class _HTTPPort:
+    default_port = 80
+
+
+def _host_key(host: str) -> str:
+    """比较用的主机名：去括号和末尾点、IP 规范化、IDNA。失败就退回原字符串。"""
+    text = (host or "").strip().lower().rstrip(".")
+    if len(text) >= 2 and text.startswith("[") and text.endswith("]"):
+        text = text[1:-1]
+    try:
+        return str(ipaddress.ip_address(text))
+    except ValueError:
+        pass
+    try:
+        return text.encode("idna").decode("ascii")
+    except UnicodeError:
+        return text
+
+
+def _connect_host(url: str) -> str:
+    """urllib 真正交给 getaddrinfo 的主机（含百分号解码后的 userinfo，去掉端口）。"""
+    req = urllib.request.Request(url)
+    if not req.host:
+        raise BlockedUrlError("网址主机名含混，已拒绝抓取")
+    host, _port = http.client.HTTPConnection._get_hostport(_HTTPPort(), req.host, None)
+    http.client.HTTPConnection._validate_host(_HTTPPort(), host)
+    return host
+
+
+def ensure_fetch_allowed(url: str):
     """只允许 http(s)。主机名缺失、解析失败、或任一地址命中内网/保留网段，就拒绝。
     标准 IP 字面量直接判。ipaddress 不认、但 inet_aton 认的缩写或进制写法，
-    按解析出的 IPv4 判。其余走 DNS，任一命中即拦。解析失败也拒绝。"""
+    按解析出的 IPv4 判。其余走 DNS，任一命中即拦。解析失败也拒绝。
+    urlparse 看到的主机必须和 urllib 拿去解析的主机是同一个，否则拒绝。
+    返回已放行的 IP 列表，供本次连接钉死；测试把本函数换成返回 None 时不钉。"""
     parts = urllib.parse.urlparse(url)
     if parts.scheme not in ("http", "https"):
         raise BlockedUrlError("只允许抓取 http(s) 地址")
     host = parts.hostname
     if not host:
         raise BlockedUrlError("网址缺少主机名，已拒绝抓取")
+    try:
+        connect_host = _connect_host(url)
+    except (http.client.InvalidURL, UnicodeError, ValueError) as exc:
+        raise BlockedUrlError("网址主机名含混，已拒绝抓取") from exc
+    if _host_key(connect_host) != _host_key(host):
+        raise BlockedUrlError("网址主机名含混，已拒绝抓取")
     addresses = _addresses_for_host(host)
     if not addresses:
         raise BlockedUrlError(f"域名解析失败，已拒绝抓取：{host}")
     for ip_text in addresses:
         if not _is_public_ip(ip_text):
             raise BlockedUrlError(f"拒绝抓取内网/保留地址：{host}（{ip_text}）")
+    return addresses
 
 
 def _addresses_for_host(host: str) -> list:
@@ -116,7 +180,12 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
-_FETCH_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+# 空代理表：不读 HTTP_PROXY / 系统代理。否则 TCP 连的是代理，已校验的 IP 约束不到目标。
+_FETCH_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}),
+    _NoRedirectHandler(),
+)
+_dns_pin_lock = threading.Lock()
 
 from contextlib import asynccontextmanager
 
@@ -317,19 +386,70 @@ CONTENT = "{http://purl.org/rss/1.0/modules/content/}"
 RDF_ROOT = "{http://www.w3.org/1999/02/22-rdf-syntax-ns#}RDF"
 
 
+def _port_number(port) -> int:
+    if isinstance(port, int):
+        return port
+    if isinstance(port, str) and port.isdigit():
+        return int(port)
+    if not port:
+        return 0
+    try:
+        return socket.getservbyname(str(port))
+    except OSError:
+        return 0
+
+
+def _open_pinned(req, ips, timeout):
+    """ips 为已放行的 IP 时，本次 getaddrinfo 只返回这些地址，不再二次解析。"""
+    if not ips:
+        return _FETCH_OPENER.open(req, timeout=timeout)
+    want = _host_key(urllib.parse.urlsplit(req.full_url).hostname or "")
+    pinned = []
+    for ip_text in ips:
+        ip = ipaddress.ip_address(ip_text)
+        family = socket.AF_INET6 if isinstance(ip, ipaddress.IPv6Address) else socket.AF_INET
+        pinned.append((family, str(ip)))
+
+    def patched(hostname, port, family=0, type=0, proto=0, flags=0):
+        text = hostname
+        if isinstance(text, str) and text.startswith("[") and text.endswith("]"):
+            text = text[1:-1]
+        if not isinstance(text, str) or _host_key(text) != want:
+            return real(hostname, port, family, type, proto, flags)
+        port_n = _port_number(port)
+        results = []
+        for fam, ip_text in pinned:
+            if family not in (0, fam) or type not in (0, socket.SOCK_STREAM):
+                continue
+            sockaddr = (ip_text, port_n, 0, 0) if fam == socket.AF_INET6 else (ip_text, port_n)
+            results.append((fam, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", sockaddr))
+        if not results:
+            raise socket.gaierror(0, "pinned address family mismatch")
+        return results
+
+    with _dns_pin_lock:
+        real = socket.getaddrinfo
+        socket.getaddrinfo = patched
+        try:
+            return _FETCH_OPENER.open(req, timeout=timeout)
+        finally:
+            socket.getaddrinfo = real
+
+
 def fetch_url(url: str, etag: str = "", last_modified: str = ""):
     """返回 (status, text, etag, last_modified)。status: ok / not_modified。
     重定向自己跟，每一跳都过 SSRF 校验；响应体超过 5MB 拒绝。"""
     current = url
     for _ in range(MAX_REDIRECTS + 1):
-        ensure_fetch_allowed(current)
+        allowed = ensure_fetch_allowed(current)
+        ips = allowed if isinstance(allowed, list) else None
         req = urllib.request.Request(current, headers={"User-Agent": USER_AGENT})
         if etag and current == url:
             req.add_header("If-None-Match", etag)
         if last_modified and current == url:
             req.add_header("If-Modified-Since", last_modified)
         try:
-            resp = _FETCH_OPENER.open(req, timeout=FETCH_TIMEOUT)
+            resp = _open_pinned(req, ips, FETCH_TIMEOUT)
         except urllib.error.HTTPError as exc:
             if exc.code == 304:
                 return ("not_modified", "", etag, last_modified, "")
@@ -467,7 +587,7 @@ def parse_feed(xml_text: str):
                 _text(e, ATOM + "content", ATOM + "summary"),
                 _text(e, ATOM + "published", ATOM + "updated"),
             )
-        return title, site_url, entries
+        return title, _clean_url(site_url), entries  # P2-5：site_url 同样只留 http(s)，防 javascript: 流进 OPML 的 htmlUrl
 
     # RSS 2.0: rss/channel/item；RSS 1.0: rdf:RDF/item
     ns10 = "{http://purl.org/rss/1.0/}"
@@ -496,7 +616,7 @@ def parse_feed(xml_text: str):
                 _text(it, ns + "description"),
                 _text(it, DC + "date"),
             )
-        return title, site_url, entries
+        return title, _clean_url(site_url), entries  # P2-5：site_url 同样只留 http(s)，防 javascript: 流进 OPML 的 htmlUrl
     for it in items:
         add(
             _text(it, "guid"),
@@ -506,7 +626,7 @@ def parse_feed(xml_text: str):
             _text(it, CONTENT + "encoded", "description"),
             _text(it, "pubDate", DC + "date"),
         )
-    return title, site_url, entries
+    return title, _clean_url(site_url), entries  # P2-5：site_url 同样只留 http(s)
 
 
 _refresh_lock = threading.Lock()
