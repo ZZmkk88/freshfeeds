@@ -496,3 +496,41 @@ def test_site_url_javascript_blanked(client, monkeypatch):
     assert feeds["https://jsx.example/rss"]["site_url"] == ""
     opml = client.get("/api/opml/export", headers=auth).text
     assert "javascript:" not in opml
+
+
+def test_long_password_login_rejected_before_hash(client, monkeypatch):
+    """P1-3：超长密码登录在调 PBKDF2 之前直接 401，不泄露哪一项超长。"""
+    def no_hash(*a, **k):
+        raise AssertionError("hash_pw 不该被超长输入调到")
+    monkeypatch.setattr(appmod, "hash_pw", no_hash)
+    r = client.post("/api/login", json={"username": "admin", "password": "x" * 129})
+    assert r.status_code == 401
+    assert r.json()["detail"] == "用户名或密码不对"
+
+
+def test_long_username_login_rejected(client, monkeypatch):
+    """P1-3：超长用户名同样在哈希前 401。"""
+    def no_hash(*a, **k):
+        raise AssertionError("hash_pw 不该被超长输入调到")
+    monkeypatch.setattr(appmod, "hash_pw", no_hash)
+    r = client.post("/api/login", json={"username": "u" * 129, "password": "admin123"})
+    assert r.status_code == 401
+    # 正常登录不受影响
+    monkeypatch.undo()
+    assert login(client)
+
+
+def test_long_password_change_rejected(client):
+    """P1-3：改密时旧/新密码超 128 在哈希前 400；6 位下限检查保留。"""
+    auth = login(client)
+    r = client.post("/api/change-password",
+                    json={"old_password": "admin123", "new_password": "y" * 129}, headers=auth)
+    assert r.status_code == 400
+    assert "过长" in r.json()["detail"]
+    r = client.post("/api/change-password",
+                    json={"old_password": "z" * 129, "new_password": "newpass1"}, headers=auth)
+    assert r.status_code == 400
+    r = client.post("/api/change-password",
+                    json={"old_password": "admin123", "new_password": "short"}, headers=auth)
+    assert r.status_code == 400
+    assert "至少 6 位" in r.json()["detail"]
