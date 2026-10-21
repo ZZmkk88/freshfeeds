@@ -1002,7 +1002,7 @@ async def import_opml(file: UploadFile = File(...), user=Depends(current_user)):
                         (
                             xml_url,
                             o.get("text") or o.get("title") or "",
-                            o.get("htmlUrl") or "",
+                            _clean_url(o.get("htmlUrl") or ""),  # TASK-063：导入路径的 htmlUrl 同样只留 http(s)
                             cid,
                             now_iso(),
                         ),
