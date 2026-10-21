@@ -24,6 +24,15 @@
 - P2-5（README 数据库路径表述）：已修，写明路径相对 app.py 所在目录。
 - P2-6（httpx 的 Starlette 弃用警告）：**不修**。任务不许改依赖版本号，且警告无害、不影响功能。
 
+## TASK-057（SSRF 纵深防御两轮，review+fix）
+
+- P1-1：过渡地址内嵌私网 IPv4 之前被放行。新增 `_embedded_ipv4()`，把 6to4 / NAT64（含 64:ff9b:1::/48）/ Teredo / IPv4-compatible 的内嵌 IPv4 抽出来再走原网段黑名单。198.18.0.0/15 仍放行（第 3 条，假 IP DNS 环境不误伤真实网站）。
+- P1-2：校验的主机 ≠ urllib 实际解析的主机（如 `http://127.0.0.1%23@8.8.8.8/feed`）、环境 HTTP_PROXY 会把请求交给代理、解析后用原始 URL 二次解析。已修：`_connect_host` 算出 urllib 真正交给 getaddrinfo 的主机，与 urlparse 主机对不上就拒绝；opener 换空 `ProxyHandler` 不再读环境代理；`ensure_fetch_allowed` 返回已放行 IP，`fetch_url` 在本次 open 期间用全局锁钉死 getaddrinfo（finally 恢复）。复核结论：刷新本来就是串行循环，锁只裹住一次 open，开销可接受；family/type 只有在显式请求非 0 时才过滤，urllib 传的是 0/SOCK_STREAM，不影响正常抓取；`_get_hostport`/`_validate_host` 为标准库私有 API，README 要求 Python 3.10+，实测 3.12 可用。
+- P2-1/2/3/4（文档）：顺手修了——README 删掉对话框并不存在的"可跳过"按钮承诺、补上自动发现的前提条件、目录清单补上 DECISIONS.md/LICENSE/requirements；NOTES 的"首登强制改密"旧文案按第 1 条改成"只提示、不强制"。
+- P2-5（site_url 入库）：修了。`parse_feed` 三处 return 的 site_url 全部过 `_clean_url`，`javascript:` 频道链接不再流进 OPML 的 htmlUrl；新增回归测试。
+- P2-6（httpx 弃用警告）：不修（第 25 条：不许改依赖版本号）。
+- 本轮无口径冲突：报告主动引用 DECISIONS 关闭"强制改密"，P2-6 引用第 25 条。
+
 ## TASK-044（深度审查第二轮，review+fix）
 
 - P1-1 前端 esc 引号转义：采纳。`esc` 改为一次替换转义 `& < > " '`，防属性注入。
