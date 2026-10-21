@@ -145,6 +145,7 @@ async function api(path, opts = {}) {
   return data;
 }
 function esc(s) { const d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
+function safeHref(s) { const t = (s || '').trim(); if (!/^https?:\/\//i.test(t)) return ''; return esc(t); }
 function fmtTime(s) { if (!s) return ''; const d = new Date(s); return d.toLocaleString('zh-CN', { hour12: false }); }
 
 async function doLogin() {
@@ -175,7 +176,7 @@ async function loadSide() {
   document.getElementById('catList').innerHTML = cats.map(c =>
     `<div class="navitem ${curCat === c.id ? 'active' : ''}" onclick="pickFeed(0,${c.id})"><span>${esc(c.name)}（${c.feed_count} 源）</span><button class="del" title="删分类" onclick="event.stopPropagation();delCategory(${c.id})">✕</button></div>`).join('') || '<div style="color:var(--mut);font-size:13px">还没有分类</div>';
   document.getElementById('feedList').innerHTML = feeds.map(f =>
-    `<div class="navitem ${curFeed === f.id ? 'active' : ''}" onclick="pickFeed(${f.id},0)"><span title="${esc(f.last_error || f.url)}">${esc(f.title || f.url)}${f.last_error ? ' ⚠️' : ''}</span><span>${f.unread ? `<span class="badge">${f.unread}</span>` : ''}<button class="del" title="退订" onclick="event.stopPropagation();delFeed(${f.id})">✕</button></span></div>`).join('') || '<div style="color:var(--mut);font-size:13px">还没有订阅</div>';
+    `<div class="navitem ${curFeed === f.id ? 'active' : ''}" onclick="pickFeed(${f.id},0)"><span title="${esc(f.last_error || f.url)}">${esc(f.title || f.url)}${f.last_error ? ' ⚠️' : ''}</span><span>${f.unread ? `<span class="badge">${f.unread}</span>` : ''}<button title="刷新此源" style="border:none;background:none;padding:0 4px" onclick="event.stopPropagation();refreshFeed(${f.id})">⟳</button><button class="del" title="退订" onclick="event.stopPropagation();delFeed(${f.id})">✕</button></span></div>`).join('') || '<div style="color:var(--mut);font-size:13px">还没有订阅</div>';
 }
 function pickFeed(fid, cid) { curFeed = fid; curCat = cid; onlyUnread = false; loadSide(); loadEntries(); }
 function pickUnread() { curFeed = 0; curCat = 0; onlyUnread = true; loadSide(); loadEntries(); }
@@ -190,7 +191,7 @@ async function loadEntries(more = false) {
   const box = document.getElementById('entries');
   const html = list.map(e => `
     <div class="card ${e.status === 'read' ? 'read' : ''}" id="card${e.id}">
-      <h2>${e.status === 'unread' ? '<span class="dot"></span>' : ''}<a href="${esc(e.url)}" target="_blank" rel="noopener" onclick="markRead(${e.id},true)">${esc(e.title)}</a></h2>
+      <h2>${e.status === 'unread' ? '<span class="dot"></span>' : ''}<a href="${safeHref(e.url)}" target="_blank" rel="noopener" onclick="markRead(${e.id},true)">${esc(e.title)}</a></h2>
       <div class="meta"><span>${esc(e.feed_title)}</span><span>${fmtTime(e.published_at || e.fetched_at)}</span>${e.author ? `<span>${esc(e.author)}</span>` : ''}</div>
       ${e.content ? `<p class="snippet">${esc(e.content)}</p>` : ''}
       <div class="ops">
@@ -205,6 +206,7 @@ async function loadEntries(more = false) {
 async function markRead(id, silent) { try { await api('/api/entries/' + id + '/status', { method: 'PUT', body: JSON.stringify({ status: 'read' }) }); const c = document.getElementById('card' + id); if (c) c.classList.add('read'); loadSide(); } catch (e) {} }
 async function toggleRead(id, cur) { const next = cur === 'read' ? 'unread' : 'read'; await api('/api/entries/' + id + '/status', { method: 'PUT', body: JSON.stringify({ status: next }) }); loadEntries(); loadSide(); }
 async function markAllRead() { await api('/api/entries/mark-all-read?feed_id=' + curFeed + '&category_id=' + curCat, { method: 'POST' }); loadEntries(); loadSide(); }
+async function refreshFeed(id) { await api('/api/feeds/' + id + '/refresh', { method: 'POST' }); loadSide(); loadEntries(); }
 async function refreshAll() { const m = document.getElementById('feedMsg'); m.textContent = '正在刷新…'; const r = await api('/api/feeds/refresh-all', { method: 'POST' }); m.textContent = `刷新完：${r.feeds} 个源，新增 ${r.added} 篇，失败 ${r.failed} 个`; loadEntries(); loadSide(); }
 async function addFeed() {
   const url = document.getElementById('feedUrl').value.trim(), cat = document.getElementById('feedCat').value.trim();
