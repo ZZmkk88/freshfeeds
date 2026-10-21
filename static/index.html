@@ -54,7 +54,14 @@
   dialog h3 { margin-top:0; }
   dialog .row { margin-bottom:12px; }
   dialog input, dialog select { width:100%; }
-  @media (max-width:760px){ aside{display:none} main{padding:14px} }
+  #menuBtn { display:none; }
+  /* 窄屏：侧栏变抽屉，点"菜单"按钮滑出，选完自动收回 */
+  @media (max-width:760px){
+    aside { display:none; position:fixed; left:0; top:0; bottom:0; z-index:50; width:272px; box-shadow:0 0 24px rgba(0,0,0,.25); }
+    aside.open { display:block; }
+    main { padding:14px; }
+    #menuBtn { display:inline-block; }
+  }
 </style>
 </head>
 <body>
@@ -95,6 +102,7 @@
     </aside>
     <main>
       <div class="toolbar">
+        <button id="menuBtn" onclick="toggleSide()">☰ 菜单</button>
         <button class="primary" onclick="document.getElementById('addDlg').showModal()">＋ 添加订阅</button>
         <button onclick="refreshAll()">⟳ 刷新全部</button>
         <button onclick="markAllRead()">全部标已读</button>
@@ -182,8 +190,10 @@ async function loadSide() {
   document.getElementById('feedList').innerHTML = feeds.map(f =>
     `<div class="navitem ${curFeed === f.id ? 'active' : ''}" onclick="pickFeed(${f.id},0)"><span title="${esc(f.last_error || f.url)}">${esc(f.title || f.url)}${f.last_error ? ' ⚠️' : ''}</span><span>${f.unread ? `<span class="badge">${f.unread}</span>` : ''}<button title="刷新此源" style="border:none;background:none;padding:0 4px" onclick="event.stopPropagation();refreshFeed(${f.id})">⟳</button><button class="del" title="退订" onclick="event.stopPropagation();delFeed(${f.id})">✕</button></span></div>`).join('') || '<div style="color:var(--mut);font-size:13px">还没有订阅</div>';
 }
-function pickFeed(fid, cid) { curFeed = fid; curCat = cid; onlyUnread = false; loadSide(); loadEntries(); }
-function pickUnread() { curFeed = 0; curCat = 0; onlyUnread = true; loadSide(); loadEntries(); }
+function toggleSide() { document.querySelector('aside').classList.toggle('open'); }
+function closeSide() { document.querySelector('aside').classList.remove('open'); }
+function pickFeed(fid, cid) { curFeed = fid; curCat = cid; onlyUnread = false; closeSide(); loadSide(); loadEntries(); }
+function pickUnread() { curFeed = 0; curCat = 0; onlyUnread = true; closeSide(); loadSide(); loadEntries(); }
 
 async function loadEntries(more = false) {
   if (!more) offset = 0;
