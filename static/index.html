@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>freshfeeds · 清泉阅读</title>
+<style>
+  :root { --teal:#0b8a6d; --teal-dark:#076b54; --ink:#1d2b26; --mut:#6b7d76; --line:#dce8e3; --bg:#f4f8f6; --card:#ffffff; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:"Segoe UI","Microsoft YaHei",sans-serif; background:var(--bg); color:var(--ink); }
+  button { cursor:pointer; border:1px solid var(--line); background:#fff; border-radius:8px; padding:6px 12px; font-size:14px; }
+  button.primary { background:var(--teal); color:#fff; border-color:var(--teal); }
+  button.primary:hover { background:var(--teal-dark); }
+  button.danger { color:#b3261e; }
+  input, select { padding:7px 10px; border:1px solid var(--line); border-radius:8px; font-size:14px; background:#fff; }
+  a { color:var(--teal-dark); }
+
+  /* 登录 */
+  #loginView { max-width:360px; margin:12vh auto; background:var(--card); padding:32px; border-radius:16px; box-shadow:0 6px 30px rgba(11,138,109,.15); }
+  #loginView h1 { margin:0 0 4px; font-size:26px; color:var(--teal-dark); }
+  #loginView p { color:var(--mut); margin:0 0 20px; }
+  #loginView input { width:100%; margin-bottom:12px; }
+  #loginView button { width:100%; }
+  .err { color:#b3261e; min-height:20px; font-size:13px; }
+
+  /* 主布局：左侧栏 + 右侧文章流 */
+  #appView { display:none; }
+  .layout { display:flex; min-height:100vh; }
+  aside { width:272px; flex:none; background:var(--card); border-right:1px solid var(--line); padding:18px 14px; position:sticky; top:0; height:100vh; overflow:auto; }
+  aside .brand { font-size:22px; font-weight:700; color:var(--teal-dark); }
+  aside .brand small { display:block; font-size:12px; color:var(--mut); font-weight:400; margin-top:2px; }
+  .side-sec { margin-top:20px; }
+  .side-sec h3 { font-size:12px; letter-spacing:.08em; color:var(--mut); margin:0 0 8px; }
+  .navitem { display:flex; justify-content:space-between; align-items:center; padding:7px 10px; border-radius:8px; cursor:pointer; font-size:14px; }
+  .navitem:hover { background:var(--bg); }
+  .navitem.active { background:#e2f2ec; color:var(--teal-dark); font-weight:600; }
+  .navitem .badge { background:var(--teal); color:#fff; font-size:11px; border-radius:10px; padding:1px 7px; }
+  .navitem .del { color:#b3261e; border:none; background:none; padding:0 2px; font-size:13px; }
+  main { flex:1; padding:20px 26px; max-width:900px; }
+  .toolbar { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:16px; }
+  .toolbar .spacer { flex:1; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px 16px; margin-bottom:12px; }
+  .card.read { opacity:.62; }
+  .card h2 { font-size:17px; margin:0 0 6px; line-height:1.45; }
+  .card h2 a { color:var(--ink); text-decoration:none; }
+  .card h2 a:hover { color:var(--teal-dark); }
+  .meta { font-size:12px; color:var(--mut); display:flex; gap:10px; flex-wrap:wrap; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--teal); margin-right:6px; }
+  .snippet { color:#41554d; font-size:14px; line-height:1.6; margin:8px 0 0; display:none; }
+  .card.open .snippet { display:block; }
+  .card .ops { margin-top:8px; display:flex; gap:8px; }
+  .empty { color:var(--mut); text-align:center; padding:60px 0; }
+  dialog { border:1px solid var(--line); border-radius:14px; padding:22px; width:min(440px,92vw); }
+  dialog h3 { margin-top:0; }
+  dialog .row { margin-bottom:12px; }
+  dialog input, dialog select { width:100%; }
+  @media (max-width:760px){ aside{display:none} main{padding:14px} }
+</style>
+</head>
+<body>
+
+<div id="loginView">
+  <h1>freshfeeds</h1>
+  <p>清泉阅读 · 自己的 RSS 订阅小站</p>
+  <div class="err" id="loginErr"></div>
+  <input id="lgUser" placeholder="用户名" autocomplete="username">
+  <input id="lgPass" type="password" placeholder="密码" autocomplete="current-password">
+  <button class="primary" onclick="doLogin()">登录</button>
+  <p style="margin-top:14px;font-size:12px">默认账号 admin / admin123，首次登录会要求改密码。</p>
+</div>
+
+<div id="appView">
+  <div class="layout">
+    <aside>
+      <div class="brand">freshfeeds<small>清泉阅读 · RSS 订阅</small></div>
+      <div class="side-sec">
+        <div class="navitem" id="navAll" onclick="pickFeed(0,0)"><span>全部文章</span><span class="badge" id="allUnread" style="display:none"></span></div>
+        <div class="navitem" id="navUnread" onclick="pickUnread()"><span>只看未读</span></div>
+      </div>
+      <div class="side-sec">
+        <h3>分类</h3>
+        <div id="catList"></div>
+        <div style="display:flex;gap:6px;margin-top:8px">
+          <input id="newCat" placeholder="新分类名" style="flex:1;min-width:0">
+          <button onclick="addCategory()">加</button>
+        </div>
+      </div>
+      <div class="side-sec">
+        <h3>订阅源</h3>
+        <div id="feedList"></div>
+      </div>
+      <div class="side-sec">
+        <button onclick="logout()" style="width:100%">退出登录</button>
+      </div>
+    </aside>
+    <main>
+      <div class="toolbar">
+        <button class="primary" onclick="document.getElementById('addDlg').showModal()">＋ 添加订阅</button>
+        <button onclick="refreshAll()">⟳ 刷新全部</button>
+        <button onclick="markAllRead()">全部标已读</button>
+        <input id="q" placeholder="搜标题/正文…" style="flex:1;min-width:140px" onkeydown="if(event.key==='Enter')loadEntries()">
+        <button onclick="loadEntries()">搜索</button>
+        <span class="spacer"></span>
+        <button onclick="exportOpml()">导出 OPML</button>
+        <label style="border:1px solid var(--line);background:#fff;border-radius:8px;padding:6px 12px;font-size:14px;cursor:pointer">
+          导入 OPML<input type="file" id="opmlFile" accept=".opml,.xml" style="display:none" onchange="importOpml(this)">
+        </label>
+      </div>
+      <div id="feedMsg" class="err"></div>
+      <div id="entries"></div>
+      <div style="text-align:center;margin:18px 0"><button id="moreBtn" onclick="loadEntries(true)" style="display:none">加载更多</button></div>
+    </main>
+  </div>
+</div>
+
+<dialog id="addDlg">
+  <h3>添加订阅</h3>
+  <div class="row"><input id="feedUrl" placeholder="源地址，如 https://example.com/feed.xml（填网站首页也可以，会自动找源）"></div>
+  <div class="row"><input id="feedCat" placeholder="分类名（可空，填了自动建）"></div>
+  <div class="row" style="display:flex;gap:8px;justify-content:flex-end">
+    <button onclick="document.getElementById('addDlg').close()">取消</button>
+    <button class="primary" onclick="addFeed()">添加并抓取</button>
+  </div>
+  <div class="err" id="addErr"></div>
+</dialog>
+
+<dialog id="pwDlg">
+  <h3>首次登录请改密码</h3>
+  <div class="row"><input id="oldPw" type="password" placeholder="旧密码"></div>
+  <div class="row"><input id="newPw" type="password" placeholder="新密码（至少 6 位）"></div>
+  <div class="row" style="text-align:right"><button class="primary" onclick="changePw()">保存</button></div>
+  <div class="err" id="pwErr"></div>
+</dialog>
+
+<script>
+let token = localStorage.getItem('ff_token') || '';
+let curFeed = 0, curCat = 0, onlyUnread = false, offset = 0;
+const PAGE = 30;
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, { ...opts, headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', ...(opts.headers || {}) } });
+  if (r.status === 401 && token) { logout(); throw new Error('登录过期'); }
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.detail || ('出错了 ' + r.status));
+  return data;
+}
+function esc(s) { const d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
+function fmtTime(s) { if (!s) return ''; const d = new Date(s); return d.toLocaleString('zh-CN', { hour12: false }); }
+
+async function doLogin() {
+  const u = document.getElementById('lgUser').value.trim(), p = document.getElementById('lgPass').value;
+  try {
+    const r = await fetch('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: u, password: p }) });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.detail || '登录失败');
+    token = data.token; localStorage.setItem('ff_token', token);
+    enterApp();
+    if (data.must_change_password) document.getElementById('pwDlg').showModal();
+  } catch (e) { document.getElementById('loginErr').textContent = e.message; }
+}
+async function changePw() {
+  try {
+    await api('/api/change-password', { method: 'POST', body: JSON.stringify({ old_password: document.getElementById('oldPw').value, new_password: document.getElementById('newPw').value }) });
+    document.getElementById('pwDlg').close();
+  } catch (e) { document.getElementById('pwErr').textContent = e.message; }
+}
+function logout() { token = ''; localStorage.removeItem('ff_token'); document.getElementById('appView').style.display = 'none'; document.getElementById('loginView').style.display = 'block'; }
+function enterApp() { document.getElementById('loginView').style.display = 'none'; document.getElementById('appView').style.display = 'block'; loadSide(); loadEntries(); }
+
+async function loadSide() {
+  const [cats, feeds] = await Promise.all([api('/api/categories'), api('/api/feeds')]);
+  const totalUnread = feeds.reduce((s, f) => s + (f.unread || 0), 0);
+  const b = document.getElementById('allUnread');
+  b.style.display = totalUnread ? '' : 'none'; b.textContent = totalUnread;
+  document.getElementById('catList').innerHTML = cats.map(c =>
+    `<div class="navitem ${curCat === c.id ? 'active' : ''}" onclick="pickFeed(0,${c.id})"><span>${esc(c.name)}（${c.feed_count} 源）</span><button class="del" title="删分类" onclick="event.stopPropagation();delCategory(${c.id})">✕</button></div>`).join('') || '<div style="color:var(--mut);font-size:13px">还没有分类</div>';
+  document.getElementById('feedList').innerHTML = feeds.map(f =>
+    `<div class="navitem ${curFeed === f.id ? 'active' : ''}" onclick="pickFeed(${f.id},0)"><span title="${esc(f.last_error || f.url)}">${esc(f.title || f.url)}${f.last_error ? ' ⚠️' : ''}</span><span>${f.unread ? `<span class="badge">${f.unread}</span>` : ''}<button class="del" title="退订" onclick="event.stopPropagation();delFeed(${f.id})">✕</button></span></div>`).join('') || '<div style="color:var(--mut);font-size:13px">还没有订阅</div>';
+}
+function pickFeed(fid, cid) { curFeed = fid; curCat = cid; onlyUnread = false; loadSide(); loadEntries(); }
+function pickUnread() { curFeed = 0; curCat = 0; onlyUnread = true; loadSide(); loadEntries(); }
+
+async function loadEntries(more = false) {
+  if (!more) offset = 0;
+  const q = document.getElementById('q').value.trim();
+  const params = new URLSearchParams({ limit: PAGE, offset, status: onlyUnread ? 'unread' : 'all', q });
+  if (curFeed) params.set('feed_id', curFeed);
+  if (curCat) params.set('category_id', curCat);
+  const list = await api('/api/entries?' + params);
+  const box = document.getElementById('entries');
+  const html = list.map(e => `
+    <div class="card ${e.status === 'read' ? 'read' : ''}" id="card${e.id}">
+      <h2>${e.status === 'unread' ? '<span class="dot"></span>' : ''}<a href="${esc(e.url)}" target="_blank" rel="noopener" onclick="markRead(${e.id},true)">${esc(e.title)}</a></h2>
+      <div class="meta"><span>${esc(e.feed_title)}</span><span>${fmtTime(e.published_at || e.fetched_at)}</span>${e.author ? `<span>${esc(e.author)}</span>` : ''}</div>
+      ${e.content ? `<p class="snippet">${esc(e.content)}</p>` : ''}
+      <div class="ops">
+        ${e.content ? `<button onclick="document.getElementById('card${e.id}').classList.toggle('open')">看摘要</button>` : ''}
+        <button onclick="toggleRead(${e.id},'${e.status}')">${e.status === 'read' ? '标未读' : '标已读'}</button>
+      </div>
+    </div>`).join('');
+  box.innerHTML = more ? box.innerHTML + html : (html || '<div class="empty">这里还没有文章。点「添加订阅」加个源，再点「刷新全部」。</div>');
+  offset += list.length;
+  document.getElementById('moreBtn').style.display = list.length === PAGE ? '' : 'none';
+}
+async function markRead(id, silent) { try { await api('/api/entries/' + id + '/status', { method: 'PUT', body: JSON.stringify({ status: 'read' }) }); const c = document.getElementById('card' + id); if (c) c.classList.add('read'); loadSide(); } catch (e) {} }
+async function toggleRead(id, cur) { const next = cur === 'read' ? 'unread' : 'read'; await api('/api/entries/' + id + '/status', { method: 'PUT', body: JSON.stringify({ status: next }) }); loadEntries(); loadSide(); }
+async function markAllRead() { await api('/api/entries/mark-all-read?feed_id=' + curFeed + '&category_id=' + curCat, { method: 'POST' }); loadEntries(); loadSide(); }
+async function refreshAll() { const m = document.getElementById('feedMsg'); m.textContent = '正在刷新…'; const r = await api('/api/feeds/refresh-all', { method: 'POST' }); m.textContent = `刷新完：${r.feeds} 个源，新增 ${r.added} 篇，失败 ${r.failed} 个`; loadEntries(); loadSide(); }
+async function addFeed() {
+  const url = document.getElementById('feedUrl').value.trim(), cat = document.getElementById('feedCat').value.trim();
+  try {
+    const r = await api('/api/feeds', { method: 'POST', body: JSON.stringify({ url, category_name: cat }) });
+    document.getElementById('addDlg').close();
+    document.getElementById('feedMsg').textContent = r.warning ? ('已添加，但首次抓取有问题：' + r.warning) : `已添加，抓到 ${r.added} 篇`;
+    loadSide(); loadEntries();
+  } catch (e) { document.getElementById('addErr').textContent = e.message; }
+}
+async function delFeed(id) { if (!confirm('退订这个源？它的文章会一起删掉。')) return; await api('/api/feeds/' + id, { method: 'DELETE' }); if (curFeed === id) curFeed = 0; loadSide(); loadEntries(); }
+async function addCategory() { const v = document.getElementById('newCat').value.trim(); if (!v) return; await api('/api/categories', { method: 'POST', body: JSON.stringify({ name: v }) }); document.getElementById('newCat').value = ''; loadSide(); }
+async function delCategory(id) { if (!confirm('删掉这个分类？源不会删，只是不再归类。')) return; await api('/api/categories/' + id, { method: 'DELETE' }); if (curCat === id) curCat = 0; loadSide(); loadEntries(); }
+function exportOpml() { fetch('/api/opml/export', { headers: { 'Authorization': 'Bearer ' + token } }).then(r => r.blob()).then(b => { const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = 'freshfeeds.opml'; a.click(); }); }
+async function importOpml(input) {
+  const f = input.files[0]; if (!f) return;
+  const fd = new FormData(); fd.append('file', f);
+  const r = await fetch('/api/opml/import', { method: 'POST', headers: { 'Authorization': 'Bearer ' + token }, body: fd });
+  const data = await r.json().catch(() => ({}));
+  document.getElementById('feedMsg').textContent = r.ok ? `导入完：共 ${data.total} 个源，新增 ${data.added}，跳过 ${data.skipped}，抓取失败 ${data.failed}` : (data.detail || '导入失败');
+  input.value = ''; loadSide(); loadEntries();
+}
+if (token) { api('/api/me').then(enterApp).catch(() => logout()); }
+</script>
+</body>
+</html>
