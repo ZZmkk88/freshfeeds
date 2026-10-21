@@ -32,6 +32,7 @@ DB_PATH = os.environ.get("FRESHFEEDS_DB", os.path.join(BASE_DIR, "data", "freshf
 REFRESH_MINUTES = int(os.environ.get("FRESHFEEDS_REFRESH_MINUTES", "30"))
 SCHEDULER_ON = os.environ.get("FRESHFEEDS_SCHEDULER", "1") != "0"
 TOKEN_TTL_HOURS = 24
+MAX_PASSWORD_CHARS = 128  # P1-3：超长密码在调 PBKDF2 之前直接拒绝（口径第 10 条）
 USER_AGENT = "freshfeeds/1.0 (+https://github.com/ZZmkk88/freshfeeds)"
 FETCH_TIMEOUT = 15
 MAX_OPML_BYTES = 2_000_000
@@ -317,6 +318,9 @@ def current_user(authorization: str = Header(default="")):
 
 @app.post("/api/login")
 def login(body: LoginIn):
+    # P1-3：超长输入在调 PBKDF2 之前直接 401，措辞不泄露哪一项超长
+    if len(body.username) > MAX_PASSWORD_CHARS or len(body.password) > MAX_PASSWORD_CHARS:
+        raise HTTPException(401, "用户名或密码不对")
     conn = db()
     row = conn.execute(
         "SELECT * FROM users WHERE username = ?", (body.username,)
@@ -350,6 +354,9 @@ def _bearer_hash(authorization: str) -> str:
 def change_password(
     body: ChangePwIn, authorization: str = Header(default=""), user=Depends(current_user)
 ):
+    # P1-3：超长密码在哈希前明确拒绝（口径第 10 条）；"至少 6 位"检查保留
+    if len(body.old_password) > MAX_PASSWORD_CHARS or len(body.new_password) > MAX_PASSWORD_CHARS:
+        raise HTTPException(400, "密码过长")
     if len(body.new_password) < 6:
         raise HTTPException(400, "新密码至少 6 位")
     conn = db()
@@ -1024,6 +1031,8 @@ async def import_opml(file: UploadFile = File(...), user=Depends(current_user)):
 
 
 def _scheduler_loop():
+    if REFRESH_MINUTES <= 0:
+        return  # P2-8：间隔设为 0 及以下时停掉定时刷新，避免 sleep(0) 空转
     while True:
         time.sleep(REFRESH_MINUTES * 60)
         try:
