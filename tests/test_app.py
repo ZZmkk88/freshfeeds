@@ -561,3 +561,95 @@ def test_opml_import_htmlurl_javascript_blanked(client, monkeypatch):
     assert feeds["https://good.example/rss"]["site_url"] == "https://good.example/"
     exported = client.get("/api/opml/export", headers=auth).text
     assert "javascript:" not in exported
+
+
+def test_siit_embedded_ipv4_blocked():
+    """TASK-070 P1-1：SIIT ::ffff:0:a.b.c.d 的内嵌私网 IPv4 被拦截。"""
+    with pytest.raises(appmod.BlockedUrlError):
+        appmod.ensure_fetch_allowed("http://[::ffff:0:127.0.0.1]/")
+    with pytest.raises(appmod.BlockedUrlError):
+        appmod.ensure_fetch_allowed("http://[::ffff:0:10.0.0.1]/")
+    # 公网内嵌与 198.18/15 照旧放行
+    appmod.ensure_fetch_allowed("http://[::ffff:0:8.8.8.8]/")
+    appmod.ensure_fetch_allowed("http://[::ffff:0:198.18.0.1]/")
+
+
+def test_nat64_48_embedded_ipv4_bits():
+    """TASK-070/074：64:ff9b:1::/48 的内嵌 IPv4 在第 48-87 位（RFC 6052），不是最低 32 位。"""
+    with pytest.raises(appmod.BlockedUrlError):
+        appmod.ensure_fetch_allowed("http://[64:ff9b:1:7f00:0:100::]/")  # 内嵌 127.0.0.1
+    appmod.ensure_fetch_allowed("http://[64:ff9b:1:808:8:800::]/")  # 内嵌 8.8.8.8，放行
+
+
+HTML_PAGE = """<html><head>
+<link rel="alternate" type="application/rss+xml" href="https://site.example/feed.xml">
+</head><body>hello</body></html>"""
+
+
+def _html_fake(mapping):
+    def fake(url, etag="", last_modified=""):
+        body = mapping[url]
+        if isinstance(body, Exception):
+            raise body
+        text, ctype = body
+        return ("ok", text, "", "", ctype)
+    return fake
+
+
+def test_discovery_failure_keeps_original_url(client, monkeypatch):
+    """TASK-067/074：发现到的地址抓取/解析失败时，订阅地址不动，只写 last_error。"""
+    auth = login(client)
+    no_ssrf(monkeypatch)
+    monkeypatch.setattr(
+        appmod, "fetch_url",
+        _html_fake({
+            "https://site.example/": (HTML_PAGE, "text/html"),
+            "https://site.example/feed.xml": RuntimeError("boom"),
+        }),
+    )
+    r = client.post("/api/feeds", json={"url": "https://site.example/"}, headers=auth)
+    assert r.status_code == 200
+    fid = r.json()["id"]
+    assert "warning" in r.json()
+    feed = [f for f in client.get("/api/feeds", headers=auth).json() if f["id"] == fid][0]
+    assert feed["url"] == "https://site.example/"
+    assert feed["last_error"] != ""
+
+
+def test_discovery_success_updates_url(client, monkeypatch):
+    """TASK-067/074：发现到的地址解析成功后，订阅地址才改写。"""
+    auth = login(client)
+    no_ssrf(monkeypatch)
+    monkeypatch.setattr(
+        appmod, "fetch_url",
+        _html_fake({
+            "https://site2.example/": (HTML_PAGE.replace("site.example", "site2.example"), "text/html"),
+            "https://site2.example/feed.xml": (RSS, "application/rss+xml"),
+        }),
+    )
+    r = client.post("/api/feeds", json={"url": "https://site2.example/"}, headers=auth)
+    assert r.status_code == 200
+    fid = r.json()["id"]
+    feed = [f for f in client.get("/api/feeds", headers=auth).json() if f["id"] == fid][0]
+    assert feed["url"] == "https://site2.example/feed.xml"
+    assert feed["title"] == "示例博客"
+
+
+LIKE_FEED = """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel><title>LIKE 测试源</title><link>https://like.example/</link>
+<item><title>100%纯棉T恤</title><link>https://like.example/1</link><guid>lk-1</guid></item>
+<item><title>纯棉背心</title><link>https://like.example/2</link><guid>lk-2</guid></item>
+</channel></rss>"""
+
+
+def test_search_like_escape(client, monkeypatch):
+    """TASK-070 P2-3：搜索关键词里的 % _ 当字面量，不当 SQL 通配符。"""
+    auth = login(client)
+    no_ssrf(monkeypatch)
+    monkeypatch.setattr(appmod, "fetch_url", fake_fetch_factory({"https://like.example/rss": LIKE_FEED}))
+    r = client.post("/api/feeds", json={"url": "https://like.example/rss"}, headers=auth)
+    assert r.status_code == 200
+    hits = client.get("/api/entries", params={"q": "100%"}, headers=auth).json()
+    assert [e["title"] for e in hits] == ["100%纯棉T恤"]
+    assert client.get("/api/entries", params={"q": "_"}, headers=auth).json() == []
+    assert len(client.get("/api/entries", params={"q": "纯棉"}, headers=auth).json()) == 2
