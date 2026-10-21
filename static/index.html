@@ -128,7 +128,7 @@
   <h3>首次登录建议改密码</h3>
   <div class="row"><input id="oldPw" type="password" placeholder="旧密码"></div>
   <div class="row"><input id="newPw" type="password" placeholder="新密码（至少 6 位）"></div>
-  <div class="row" style="text-align:right"><button class="primary" onclick="changePw()">保存</button></div>
+  <div class="row" style="text-align:right"><button onclick="document.getElementById('pwDlg').close()">稍后再说</button> <button class="primary" onclick="changePw()">保存</button></div>
   <div class="err" id="pwErr"></div>
 </dialog>
 
