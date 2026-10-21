@@ -659,12 +659,19 @@ def refresh_feed(feed_id: int) -> dict:
                 conn.commit()
                 conn.close()
                 return {"added": 0, "not_modified": True}
+            discovered_url = None
             if "html" in ctype and "<feed" not in text[:500].lower() and "<rss" not in text[:500].lower():
                 found = discover_feed_url(text, feed["url"])
                 if found and found != feed["url"]:
                     status, text, etag, lm, ctype = fetch_url(found)
-                    conn.execute("UPDATE feeds SET url = ? WHERE id = ?", (found, feed_id))
+                    # 解析成功后再改地址。失败时 except 会提交事务，不能提前 UPDATE。
+                    discovered_url = found
             title, site_url, entries = parse_feed(text)
+            if discovered_url:
+                conn.execute(
+                    "UPDATE feeds SET url = ? WHERE id = ?",
+                    (discovered_url, feed_id),
+                )
         except Exception as e:  # 网络/解析错误都记下来，不假装成功
             conn.execute(
                 "UPDATE feeds SET last_checked_at = ?, last_error = ? WHERE id = ?",
@@ -1002,7 +1009,7 @@ async def import_opml(file: UploadFile = File(...), user=Depends(current_user)):
                         (
                             xml_url,
                             o.get("text") or o.get("title") or "",
-                            o.get("htmlUrl") or "",
+                            _clean_url(o.get("htmlUrl") or ""),
                             cid,
                             now_iso(),
                         ),
