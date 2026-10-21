@@ -38,11 +38,10 @@ RDF10 = """<?xml version="1.0" encoding="UTF-8"?>
 </rdf:RDF>"""
 
 JS_FEED = """<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0"><channel><title>JS 测试源</title><link>https://js.example/</link>
+<rss version="2.0"><channel><title>JS 频道源</title><link>javascript:alert(1)</link>
 <item><title>点我</title><link>javascript:alert(1)</link><guid>js-1</guid></item>
 <item><title>正常</title><link>https://js.example/ok</link><guid>js-2</guid></item>
 </channel></rss>"""
-
 
 @pytest.fixture(scope="module")
 def client():
@@ -478,3 +477,22 @@ def test_opml_internal_url_failed(client):
     assert r.json()["added"] == 0
     feeds = client.get("/api/feeds", headers=auth).json()
     assert not any("file://" in f["url"] for f in feeds)
+
+
+JS_SITE_FEED = """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel><title>JS 频道源</title><link>javascript:alert(1)</link>
+<item><title>正常</title><link>https://jsx.example/ok</link><guid>jsx-1</guid></item>
+</channel></rss>"""
+
+
+def test_site_url_javascript_blanked(client, monkeypatch):
+    """P2-5：频道 site_url 里的 javascript: 同样入库置空，不流进 OPML 的 htmlUrl。"""
+    monkeypatch.setattr(appmod, "fetch_url", lambda *a, **k: ("ok", JS_SITE_FEED, "", ""))
+    monkeypatch.setattr(appmod, "ensure_fetch_allowed", lambda url: None)
+    auth = login(client)
+    r = client.post("/api/feeds", json={"url": "https://jsx.example/rss"}, headers=auth)
+    assert r.status_code == 200
+    feeds = {f["url"]: f for f in client.get("/api/feeds", headers=auth).json()}
+    assert feeds["https://jsx.example/rss"]["site_url"] == ""
+    opml = client.get("/api/opml/export", headers=auth).text
+    assert "javascript:" not in opml
