@@ -24,6 +24,18 @@
 - P2-5（README 数据库路径表述）：已修，写明路径相对 app.py 所在目录。
 - P2-6（httpx 的 Starlette 弃用警告）：**不修**。任务不许改依赖版本号，且警告无害、不影响功能。
 
+## TASK-067/070/074（三分支去重合并）
+
+- 三分支均为 review+fix 带真代码，改动只限 app.py，tests/ 未动；与 main 逐条去重后手工搬运，不整支合并任何分支。
+- 采纳 1：SIIT 内嵌 IPv4（TASK-070 P1-1）。`::ffff:0:a.b.c.d`（RFC 2765）在 `_embedded_ipv4` 里没被识别、放行；补上后取末 32 位再走黑名单。公网内嵌与 198.18/15 照旧放行。
+- 采纳 2：NAT64 /48 取比特（TASK-070 P1-1 之 P1-2 / TASK-074 P1-1，同义重复只取一版）。main 原来把最后 32 位当内嵌 IPv4；RFC 6052 里 /48 的内嵌在第 48–87 位（中插 1 字节 u），070 的 `raw[6:8]+raw[9:11]` 与 074 的位运算版经逐比特核对同义，取 070 版（含 SIIT 与 /96 的 raw[12:16] 等价写法）。
+- 采纳 3：自动发现解析失败仍改写订阅地址（TASK-067 P1-1 / TASK-074 P1-2，同义重复取 074 版基座新）。`refresh_feed` 里发现到的地址先抓取并解析，`parse_feed` 成功之后才 UPDATE url；失败分支只写 last_error，原地址不动。
+- 采纳 4：搜索 LIKE 转义（TASK-070 P2-3，低优但真实）。`_escape_like` 转义 `% _ \\`，配合 `ESCAPE '\\'`（dailymemo 先例）。
+- 文档小修 5：`fetch_url` 文档字符串 4 元组→5 元组（含 ctype），只改注释。
+- 文档小修（TASK-070 P2-1/2/4）：README 自动发现前提写实（Content-Type 含 html、前 500 字符判 `<feed`/`<rss`、RSS 1.0 的 `<rdf:RDF` 不在此列、解析成功才改写地址）；定时刷新加"启动后先等一个间隔"；目录清单补 `.gitignore`。
+- 关闭不采纳：067 P1-2（OPML htmlUrl _clean_url，与 TASK-063 逐字同义重复）；074 P2-1（fec0::/10）、P2-2（192.0.2.0/24 等文档段）、P2-5（注销接口，DECISIONS:32 维持）、P2-6（Starlette 弃用警告）、P2-7（LICENSE 附录版权人）、067 P2-1/2/4/5/3、070 P2-6/P2-7（测试桩禁改红线）。
+- 回归测试 5 个（口径第 17 条）：SIIT 内嵌私网拦截/公网放行、NAT64/48 取比特正误、发现失败保留原地址、发现成功改写地址、LIKE 转义。测试 31→36。
+
 ## TASK-063（OPML 导入 htmlUrl 清洗）
 
 - P1-1：采纳并手工搬运。OPML 导入路径的 `htmlUrl` 之前不经 `_clean_url`，`javascript:` 会直接写入 `feeds.site_url` 并在导出时原样写回。TASK-057 的 95df330 只清了解析路径（抓取刷新）的 site_url，导入路径是真新增量、不是重复。修法：`_clean_url(o.get("htmlUrl") or "")`。
