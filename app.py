@@ -78,8 +78,14 @@ def _embedded_ipv4(ip: ipaddress.IPv6Address):
     packed = int(ip)
     if ip in ipaddress.ip_network("2002::/16"):
         return ipaddress.IPv4Address((packed >> 80) & 0xFFFFFFFF)
-    if ip in ipaddress.ip_network("64:ff9b::/96") or ip in ipaddress.ip_network("64:ff9b:1::/48"):
+    # RFC 6052 PL=96：IPv4 在最低 32 位。
+    if ip in ipaddress.ip_network("64:ff9b::/96"):
         return ipaddress.IPv4Address(packed & 0xFFFFFFFF)
+    # RFC 6052 PL=48：IPv4 被 1 字节 u 拆开，在第 48–63 位和第 72–87 位，不在最低 32 位。
+    if ip in ipaddress.ip_network("64:ff9b:1::/48"):
+        hi = (packed >> 64) & 0xFFFF
+        lo = (packed >> 40) & 0xFFFF
+        return ipaddress.IPv4Address((hi << 16) | lo)
     if ip in ipaddress.ip_network("2001::/32"):
         return ipaddress.IPv4Address((packed & 0xFFFFFFFF) ^ 0xFFFFFFFF)
     # ::ffff:0:0/96 已在调用方转成 IPv4，不会进到这里。
@@ -659,12 +665,15 @@ def refresh_feed(feed_id: int) -> dict:
                 conn.commit()
                 conn.close()
                 return {"added": 0, "not_modified": True}
+            found = ""
             if "html" in ctype and "<feed" not in text[:500].lower() and "<rss" not in text[:500].lower():
                 found = discover_feed_url(text, feed["url"])
                 if found and found != feed["url"]:
                     status, text, etag, lm, ctype = fetch_url(found)
-                    conn.execute("UPDATE feeds SET url = ? WHERE id = ?", (found, feed_id))
             title, site_url, entries = parse_feed(text)
+            # 解析成功才改订阅地址。失败分支会提交当前事务，不能提前 UPDATE。
+            if found and found != feed["url"]:
+                conn.execute("UPDATE feeds SET url = ? WHERE id = ?", (found, feed_id))
         except Exception as e:  # 网络/解析错误都记下来，不假装成功
             conn.execute(
                 "UPDATE feeds SET last_checked_at = ?, last_error = ? WHERE id = ?",
