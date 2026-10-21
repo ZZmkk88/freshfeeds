@@ -14,12 +14,13 @@ import sqlite3
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel
 
@@ -30,6 +31,25 @@ SCHEDULER_ON = os.environ.get("FRESHFEEDS_SCHEDULER", "1") != "0"
 TOKEN_TTL_HOURS = 24
 USER_AGENT = "freshfeeds/1.0 (+https://github.com/ZZmkk88/freshfeeds)"
 FETCH_TIMEOUT = 15
+MAX_OPML_BYTES = 2_000_000
+MAX_FEED_BYTES = 5_000_000
+
+
+def _require_http_url(url: str) -> str:
+    """只允许带主机名的 http/https。拒绝 file: 等本地或非常规 scheme。"""
+    url = (url or "").strip()
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        raise ValueError("只允许 http(s) 地址")
+    return url
+
+
+def _http_url_or_blank(url: str) -> str:
+    """条目上的链接只保留 http(s)，其余（如 javascript:）丢弃。"""
+    try:
+        return _require_http_url(url)
+    except ValueError:
+        return ""
 
 from contextlib import asynccontextmanager
 
@@ -136,7 +156,7 @@ class ChangePwIn(BaseModel):
     new_password: str
 
 
-def current_user(authorization: str = Header(default="")):
+def current_user(request: Request, authorization: str = Header(default="")):
     if not authorization.startswith("Bearer "):
         raise HTTPException(401, "未登录")
     th = hashlib.sha256(authorization[7:].encode()).hexdigest()
@@ -149,6 +169,8 @@ def current_user(authorization: str = Header(default="")):
     conn.close()
     if not row:
         raise HTTPException(401, "登录已过期，请重新登录")
+    if row["must_change"] and request.url.path not in ("/api/me", "/api/change-password"):
+        raise HTTPException(403, "请先修改密码")
     return row
 
 
@@ -212,6 +234,7 @@ RDF_ROOT = "{http://www.w3.org/1999/02/22-rdf-syntax-ns#}RDF"
 
 def fetch_url(url: str, etag: str = "", last_modified: str = ""):
     """返回 (status, text, etag, last_modified)。status: ok / not_modified。"""
+    url = _require_http_url(url)
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     if etag:
         req.add_header("If-None-Match", etag)
@@ -219,7 +242,9 @@ def fetch_url(url: str, etag: str = "", last_modified: str = ""):
         req.add_header("If-Modified-Since", last_modified)
     try:
         with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as resp:
-            raw = resp.read()
+            raw = resp.read(MAX_FEED_BYTES + 1)
+            if len(raw) > MAX_FEED_BYTES:
+                raise ValueError("订阅源响应超过 5MB")
             charset = resp.headers.get_content_charset() or "utf-8"
             text = raw.decode(charset, errors="replace")
             return (
@@ -305,7 +330,7 @@ def parse_feed(xml_text: str):
             {
                 "guid": guid[:500],
                 "title": _strip_tags(title)[:300] or "(无标题)",
-                "url": url or "",
+                "url": _http_url_or_blank(url),
                 "author": author or "",
                 "content": _strip_tags(content)[:2000],
                 "published_at": _parse_date(published),
@@ -683,7 +708,12 @@ def export_opml(user=Depends(current_user)):
 
 @app.post("/api/opml/import")
 async def import_opml(file: UploadFile = File(...), user=Depends(current_user)):
-    raw = await file.read()
+    raw = await file.read(MAX_OPML_BYTES + 1)
+    if len(raw) > MAX_OPML_BYTES:
+        raise HTTPException(400, "OPML 文件超过 2MB")
+    folded = raw.upper().replace(b"\x00", b"")
+    if b"<!DOCTYPE" in folded or b"<!ENTITY" in folded:
+        raise HTTPException(400, "不接受带 DTD 或实体声明的 OPML")
     try:
         root = ET.fromstring(raw)
     except ET.ParseError:
@@ -694,9 +724,14 @@ async def import_opml(file: UploadFile = File(...), user=Depends(current_user)):
 
     def walk(parent, category_name):
         for o in parent.findall("outline"):
-            xml_url = o.get("xmlUrl") or o.get("xmlurl") or ""
+            xml_url = (o.get("xmlUrl") or o.get("xmlurl") or "").strip()
             if xml_url:
                 stats["total"] += 1
+                try:
+                    xml_url = _require_http_url(xml_url)
+                except ValueError:
+                    stats["failed"] += 1
+                    continue
                 cid = None
                 if category_name:
                     conn.execute(

@@ -145,6 +145,7 @@ async function api(path, opts = {}) {
   return data;
 }
 function esc(s) { const d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
+function safeHref(s) { const t = (s || '').trim(); if (!/^https?:\/\//i.test(t)) return ''; return esc(t); }
 function fmtTime(s) { if (!s) return ''; const d = new Date(s); return d.toLocaleString('zh-CN', { hour12: false }); }
 
 async function doLogin() {
@@ -154,14 +155,15 @@ async function doLogin() {
     const data = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(data.detail || '登录失败');
     token = data.token; localStorage.setItem('ff_token', token);
-    enterApp();
     if (data.must_change_password) document.getElementById('pwDlg').showModal();
+    else enterApp();
   } catch (e) { document.getElementById('loginErr').textContent = e.message; }
 }
 async function changePw() {
   try {
     await api('/api/change-password', { method: 'POST', body: JSON.stringify({ old_password: document.getElementById('oldPw').value, new_password: document.getElementById('newPw').value }) });
     document.getElementById('pwDlg').close();
+    enterApp();
   } catch (e) { document.getElementById('pwErr').textContent = e.message; }
 }
 function logout() { token = ''; localStorage.removeItem('ff_token'); document.getElementById('appView').style.display = 'none'; document.getElementById('loginView').style.display = 'block'; }
@@ -190,7 +192,7 @@ async function loadEntries(more = false) {
   const box = document.getElementById('entries');
   const html = list.map(e => `
     <div class="card ${e.status === 'read' ? 'read' : ''}" id="card${e.id}">
-      <h2>${e.status === 'unread' ? '<span class="dot"></span>' : ''}<a href="${esc(e.url)}" target="_blank" rel="noopener" onclick="markRead(${e.id},true)">${esc(e.title)}</a></h2>
+      <h2>${e.status === 'unread' ? '<span class="dot"></span>' : ''}<a href="${safeHref(e.url)}" target="_blank" rel="noopener" onclick="markRead(${e.id},true)">${esc(e.title)}</a></h2>
       <div class="meta"><span>${esc(e.feed_title)}</span><span>${fmtTime(e.published_at || e.fetched_at)}</span>${e.author ? `<span>${esc(e.author)}</span>` : ''}</div>
       ${e.content ? `<p class="snippet">${esc(e.content)}</p>` : ''}
       <div class="ops">
@@ -227,7 +229,13 @@ async function importOpml(input) {
   document.getElementById('feedMsg').textContent = r.ok ? `导入完：共 ${data.total} 个源，新增 ${data.added}，跳过 ${data.skipped}，抓取失败 ${data.failed}` : (data.detail || '导入失败');
   input.value = ''; loadSide(); loadEntries();
 }
-if (token) { api('/api/me').then(enterApp).catch(() => logout()); }
+document.getElementById('pwDlg').addEventListener('cancel', (e) => e.preventDefault());
+if (token) {
+  api('/api/me').then(me => {
+    if (me.must_change_password) document.getElementById('pwDlg').showModal();
+    else enterApp();
+  }).catch(() => logout());
+}
 </script>
 </body>
 </html>
