@@ -7,13 +7,16 @@
 import hashlib
 import hmac
 import html
+import ipaddress
 import os
 import re
 import secrets
+import socket
 import sqlite3
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
@@ -30,6 +33,74 @@ SCHEDULER_ON = os.environ.get("FRESHFEEDS_SCHEDULER", "1") != "0"
 TOKEN_TTL_HOURS = 24
 USER_AGENT = "freshfeeds/1.0 (+https://github.com/ZZmkk88/freshfeeds)"
 FETCH_TIMEOUT = 15
+MAX_OPML_BYTES = 2_000_000
+MAX_FEED_BYTES = 5_000_000
+MAX_REDIRECTS = 5
+
+
+# ---------------------------------------------------------------- SSRF 防护
+# 服务端抓用户给的网址前，先拦内网/保留目标（口径第 9 条）。
+# 用显式网段清单逐一判定解析出的地址，禁用 ipaddress.is_private 一刀切——
+# 本云端 DNS 是假 IP 模式，公网域名会解析到 198.18/15（基准测试保留段），
+# 一刀切会把真实网站全拦掉（bookmark-manager 的实测教训），故本清单刻意
+# 不含 198.18/15。跟随重定向时每一跳都重新校验。
+
+
+class BlockedUrlError(ValueError):
+    """抓取目标是内网/保留地址，拒绝。"""
+
+
+def resolve_host_addresses(hostname: str) -> list:
+    """把域名解析成 IP 字符串。单独拎出来，测试可以注入假的解析结果。"""
+    infos = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
+    return sorted({info[4][0] for info in infos})
+
+
+_BLOCKED_NETWORKS = [
+    ipaddress.ip_network(cidr)
+    for cidr in (
+        "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
+        "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16",
+        "224.0.0.0/4", "240.0.0.0/4",
+        "::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8",
+    )
+]
+
+
+def _is_public_ip(ip_text: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_text)
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return not any(ip in net for net in _BLOCKED_NETWORKS if net.version == ip.version)
+
+
+def ensure_fetch_allowed(url: str) -> None:
+    """网址的主机名若缺失、或解析出的任一地址命中内网/保留网段，就拒绝。
+    IP 字面量直接判；域名查全部解析结果，任一命中即拦。"""
+    host = urllib.parse.urlparse(url).hostname
+    if not host:
+        raise BlockedUrlError("网址缺少主机名，已拒绝抓取")
+    try:
+        addresses = [str(ipaddress.ip_address(host))]
+    except ValueError:
+        try:
+            addresses = resolve_host_addresses(host)
+        except OSError:
+            return  # 解析失败：抓取本身也会失败，不额外拦截
+    for ip_text in addresses:
+        if not _is_public_ip(ip_text):
+            raise BlockedUrlError(f"拒绝抓取内网/保留地址：{host}（{ip_text}）")
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_FETCH_OPENER = urllib.request.build_opener(_NoRedirectHandler())
 
 from contextlib import asynccontextmanager
 
@@ -177,8 +248,16 @@ def login(body: LoginIn):
     return {"token": token, "must_change_password": bool(row["must_change"])}
 
 
+def _bearer_hash(authorization: str) -> str:
+    if authorization.startswith("Bearer "):
+        return hashlib.sha256(authorization[7:].encode()).hexdigest()
+    return ""
+
+
 @app.post("/api/change-password")
-def change_password(body: ChangePwIn, user=Depends(current_user)):
+def change_password(
+    body: ChangePwIn, authorization: str = Header(default=""), user=Depends(current_user)
+):
     if len(body.new_password) < 6:
         raise HTTPException(400, "新密码至少 6 位")
     conn = db()
@@ -191,6 +270,11 @@ def change_password(body: ChangePwIn, user=Depends(current_user)):
     conn.execute(
         "UPDATE users SET pw_hash = ?, salt = ?, must_change = 0 WHERE id = ?",
         (hash_pw(body.new_password, salt), salt, user["id"]),
+    )
+    # 口径第 2 条：改密成功同事务吊销该用户除本次会话外的全部登录会话
+    conn.execute(
+        "DELETE FROM tokens WHERE user_id = ? AND token_hash != ?",
+        (user["id"], _bearer_hash(authorization)),
     )
     conn.commit()
     conn.close()
@@ -211,15 +295,30 @@ RDF_ROOT = "{http://www.w3.org/1999/02/22-rdf-syntax-ns#}RDF"
 
 
 def fetch_url(url: str, etag: str = "", last_modified: str = ""):
-    """返回 (status, text, etag, last_modified)。status: ok / not_modified。"""
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    if etag:
-        req.add_header("If-None-Match", etag)
-    if last_modified:
-        req.add_header("If-Modified-Since", last_modified)
-    try:
-        with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as resp:
-            raw = resp.read()
+    """返回 (status, text, etag, last_modified)。status: ok / not_modified。
+    重定向自己跟，每一跳都过 SSRF 校验；响应体超过 5MB 拒绝。"""
+    current = url
+    for _ in range(MAX_REDIRECTS + 1):
+        ensure_fetch_allowed(current)
+        req = urllib.request.Request(current, headers={"User-Agent": USER_AGENT})
+        if etag and current == url:
+            req.add_header("If-None-Match", etag)
+        if last_modified and current == url:
+            req.add_header("If-Modified-Since", last_modified)
+        try:
+            resp = _FETCH_OPENER.open(req, timeout=FETCH_TIMEOUT)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 304:
+                return ("not_modified", "", etag, last_modified, "")
+            location = exc.headers.get("Location") if exc.headers else None
+            if exc.code in (301, 302, 303, 307, 308) and location:
+                current = urllib.parse.urljoin(current, location)
+                continue
+            raise
+        with resp:
+            raw = resp.read(MAX_FEED_BYTES + 1)
+            if len(raw) > MAX_FEED_BYTES:
+                raise ValueError("订阅源响应超过 5MB")
             charset = resp.headers.get_content_charset() or "utf-8"
             text = raw.decode(charset, errors="replace")
             return (
@@ -229,10 +328,7 @@ def fetch_url(url: str, etag: str = "", last_modified: str = ""):
                 resp.headers.get("Last-Modified", "") or "",
                 resp.headers.get_content_type() or "",
             )
-    except urllib.error.HTTPError as e:
-        if e.code == 304:
-            return ("not_modified", "", etag, last_modified, "")
-        raise
+    raise BlockedUrlError("重定向次数过多，已拒绝抓取")
 
 
 def discover_feed_url(page_text: str, base_url: str) -> str:
@@ -292,6 +388,15 @@ def _strip_tags(raw: str) -> str:
     return re.sub(r"\s+", " ", html.unescape(text)).strip()
 
 
+def _clean_url(url: str) -> str:
+    """条目上的链接只保留 http(s) 的（P1-2：javascript: 等 scheme 入库置空）。"""
+    u = (url or "").strip()
+    parts = urllib.parse.urlsplit(u)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return ""
+    return u
+
+
 def parse_feed(xml_text: str):
     """解析 RSS 2.0 / RSS 1.0(RDF) / Atom，返回 (title, site_url, entries)。"""
     root = ET.fromstring(xml_text)
@@ -305,7 +410,7 @@ def parse_feed(xml_text: str):
             {
                 "guid": guid[:500],
                 "title": _strip_tags(title)[:300] or "(无标题)",
-                "url": url or "",
+                "url": _clean_url(url),
                 "author": author or "",
                 "content": _strip_tags(content)[:2000],
                 "published_at": _parse_date(published),
@@ -337,15 +442,23 @@ def parse_feed(xml_text: str):
         return title, site_url, entries
 
     # RSS 2.0: rss/channel/item；RSS 1.0: rdf:RDF/item
+    ns10 = "{http://purl.org/rss/1.0/}"
+    is_rdf = root.tag == RDF_ROOT or root.tag.endswith("}RDF")
     channel = root.find("channel") if root.tag == "rss" else root
     if channel is None:
         channel = root
-    title = _text(channel, "title")
-    site_url = _text(channel, "link")
+    if is_rdf:  # P2-1：RSS 1.0 的 channel 是 rdf:RDF 的子元素，且在默认命名空间下
+        ch = root.find(ns10 + "channel")
+        channel = ch if ch is not None else root
+        title = _text(channel, ns10 + "title")
+        site_url = _text(channel, ns10 + "link")
+    else:
+        title = _text(channel, "title")
+        site_url = _text(channel, "link")
     items = channel.findall("item")
-    if not items and root.tag.endswith("RDF"):
-        items = root.findall("{http://purl.org/rss/1.0/}item")
-        ns = "{http://purl.org/rss/1.0/}"
+    if not items and is_rdf:
+        items = root.findall(ns10 + "item")
+        ns = ns10
         for it in items:
             add(
                 it.get("{http://www.w3.org/1999/02/22-rdf-syntax-ns#}about", ""),
@@ -524,6 +637,16 @@ def create_feed(body: FeedIn, user=Depends(current_user)):
         cid = conn.execute(
             "SELECT id FROM categories WHERE name = ?", (body.category_name.strip(),)
         ).fetchone()["id"]
+    if cid is not None and not conn.execute(
+        "SELECT 1 FROM categories WHERE id = ?", (cid,)
+    ).fetchone():
+        conn.close()
+        raise HTTPException(400, "分类不存在")  # P2-3：不再报成"已经订阅过了"
+    try:
+        ensure_fetch_allowed(url)  # P1-1：内网/保留地址直接拒绝，不入库
+    except BlockedUrlError as e:
+        conn.close()
+        raise HTTPException(400, str(e))
     try:
         cur = conn.execute(
             "INSERT INTO feeds (url, category_id, created_at) VALUES (?,?,?)",
@@ -593,7 +716,8 @@ def list_entries(
         sql += " AND (e.title LIKE ? OR e.content LIKE ?)"
         args += [f"%{q.strip()}%", f"%{q.strip()}%"]
     sql += " ORDER BY COALESCE(NULLIF(e.published_at,''), e.fetched_at) DESC LIMIT ? OFFSET ?"
-    args += [min(limit, 200), offset]
+    limit = max(1, min(limit, 200))  # P2-2：负数不能绕过上限
+    args += [limit, offset]
     conn = db()
     rows = conn.execute(sql, args).fetchall()
     conn.close()
@@ -683,7 +807,12 @@ def export_opml(user=Depends(current_user)):
 
 @app.post("/api/opml/import")
 async def import_opml(file: UploadFile = File(...), user=Depends(current_user)):
-    raw = await file.read()
+    raw = await file.read(MAX_OPML_BYTES + 1)
+    if len(raw) > MAX_OPML_BYTES:  # P1-4：OPML 上传限 2MB
+        raise HTTPException(400, "OPML 文件超过 2MB")
+    folded = raw.upper().replace(b"\x00", b"")  # 去掉 NUL 再匹配，覆盖 UTF-16
+    if b"<!DOCTYPE" in folded or b"<!ENTITY" in folded:
+        raise HTTPException(400, "不接受带 DTD 或实体声明的 OPML")
     try:
         root = ET.fromstring(raw)
     except ET.ParseError:
@@ -694,9 +823,14 @@ async def import_opml(file: UploadFile = File(...), user=Depends(current_user)):
 
     def walk(parent, category_name):
         for o in parent.findall("outline"):
-            xml_url = o.get("xmlUrl") or o.get("xmlurl") or ""
+            xml_url = (o.get("xmlUrl") or o.get("xmlurl") or "").strip()
             if xml_url:
                 stats["total"] += 1
+                try:
+                    ensure_fetch_allowed(xml_url)  # P1-1：非 http(s)/内网地址不入库
+                except BlockedUrlError:
+                    stats["failed"] += 1
+                    continue
                 cid = None
                 if category_name:
                     conn.execute(
@@ -758,4 +892,9 @@ def index():
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="127.0.0.1", port=int(os.environ.get("PORT", "8000")))
+    # 口径第 3 条：默认只监听本机，需要放开走 HOST 环境变量
+    uvicorn.run(
+        app,
+        host=os.environ.get("HOST", "127.0.0.1"),
+        port=int(os.environ.get("PORT", "8000")),
+    )
