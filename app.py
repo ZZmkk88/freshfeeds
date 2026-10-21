@@ -995,7 +995,7 @@ async def import_opml(file: UploadFile = File(...), user=Depends(current_user)):
                         (
                             xml_url,
                             o.get("text") or o.get("title") or "",
-                            o.get("htmlUrl") or "",
+                            _clean_url(o.get("htmlUrl") or ""),
                             cid,
                             now_iso(),
                         ),
