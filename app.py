@@ -78,8 +78,13 @@ def _embedded_ipv4(ip: ipaddress.IPv6Address):
     packed = int(ip)
     if ip in ipaddress.ip_network("2002::/16"):
         return ipaddress.IPv4Address((packed >> 80) & 0xFFFFFFFF)
-    if ip in ipaddress.ip_network("64:ff9b::/96") or ip in ipaddress.ip_network("64:ff9b:1::/48"):
+    if ip in ipaddress.ip_network("64:ff9b::/96"):
         return ipaddress.IPv4Address(packed & 0xFFFFFFFF)
+    if ip in ipaddress.ip_network("64:ff9b:1::/48"):
+        # RFC 6052 前缀长 48：IPv4 被第 64–71 位的 u 字节拆开，末 32 位是后缀。
+        hi = (packed >> 64) & 0xFFFF
+        lo = (packed >> 40) & 0xFFFF
+        return ipaddress.IPv4Address((hi << 16) | lo)
     if ip in ipaddress.ip_network("2001::/32"):
         return ipaddress.IPv4Address((packed & 0xFFFFFFFF) ^ 0xFFFFFFFF)
     # ::ffff:0:0/96 已在调用方转成 IPv4，不会进到这里。
