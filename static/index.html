@@ -144,7 +144,11 @@ async function api(path, opts = {}) {
   if (!r.ok) throw new Error(data.detail || ('出错了 ' + r.status));
   return data;
 }
-function esc(s) { const d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
+function esc(s) {
+  return String(s || '').replace(/[&<>"']/g, function (ch) {
+    return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[ch];
+  });
+}
 function safeHref(s) { const t = (s || '').trim(); if (!/^https?:\/\//i.test(t)) return ''; return esc(t); }
 function fmtTime(s) { if (!s) return ''; const d = new Date(s); return d.toLocaleString('zh-CN', { hour12: false }); }
 
