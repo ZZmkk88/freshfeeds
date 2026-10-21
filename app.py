@@ -78,21 +78,37 @@ def _is_public_ip(ip_text: str) -> bool:
 
 
 def ensure_fetch_allowed(url: str) -> None:
-    """网址的主机名若缺失、或解析出的任一地址命中内网/保留网段，就拒绝。
-    IP 字面量直接判；域名查全部解析结果，任一命中即拦。"""
-    host = urllib.parse.urlparse(url).hostname
+    """只允许 http(s)。主机名缺失、解析失败、或任一地址命中内网/保留网段，就拒绝。
+    标准 IP 字面量直接判。ipaddress 不认、但 inet_aton 认的缩写或进制写法，
+    按解析出的 IPv4 判。其余走 DNS，任一命中即拦。解析失败也拒绝。"""
+    parts = urllib.parse.urlparse(url)
+    if parts.scheme not in ("http", "https"):
+        raise BlockedUrlError("只允许抓取 http(s) 地址")
+    host = parts.hostname
     if not host:
         raise BlockedUrlError("网址缺少主机名，已拒绝抓取")
-    try:
-        addresses = [str(ipaddress.ip_address(host))]
-    except ValueError:
-        try:
-            addresses = resolve_host_addresses(host)
-        except OSError:
-            return  # 解析失败：抓取本身也会失败，不额外拦截
+    addresses = _addresses_for_host(host)
+    if not addresses:
+        raise BlockedUrlError(f"域名解析失败，已拒绝抓取：{host}")
     for ip_text in addresses:
         if not _is_public_ip(ip_text):
             raise BlockedUrlError(f"拒绝抓取内网/保留地址：{host}（{ip_text}）")
+
+
+def _addresses_for_host(host: str) -> list:
+    try:
+        return [str(ipaddress.ip_address(host))]
+    except ValueError:
+        pass
+    try:
+        # 2130706433、127.1、0x7f000001 这类写法，inet_aton 会解成 IPv4，getaddrinfo 却可能失败。
+        return [socket.inet_ntoa(socket.inet_aton(host))]
+    except OSError:
+        pass
+    try:
+        return resolve_host_addresses(host)
+    except OSError as exc:
+        raise BlockedUrlError(f"域名解析失败，已拒绝抓取：{host}") from exc
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -113,7 +129,14 @@ async def lifespan(_app):
     yield
 
 
-app = FastAPI(title="freshfeeds", lifespan=lifespan)
+# 口径第 6 条：接口文档页默认关闭，未登录不暴露
+app = FastAPI(
+    title="freshfeeds",
+    lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
 
 # ---------------------------------------------------------------- 数据库
 
@@ -398,7 +421,12 @@ def _clean_url(url: str) -> str:
 
 
 def parse_feed(xml_text: str):
-    """解析 RSS 2.0 / RSS 1.0(RDF) / Atom，返回 (title, site_url, entries)。"""
+    """解析 RSS 2.0 / RSS 1.0(RDF) / Atom，返回 (title, site_url, entries)。
+    解析前拒绝 DTD/实体声明，防止 XML 展开内部实体（P1-3；OPML 路径已有同类拒绝）。
+    限制：CDATA 里若出现这些字面量，整份也会被拒绝；现有测试源不受影响。"""
+    folded = (xml_text or "").replace("\x00", "").upper()
+    if "<!DOCTYPE" in folded or "<!ENTITY" in folded:
+        raise ValueError("不接受带 DTD 或实体声明的订阅源")
     root = ET.fromstring(xml_text)
     entries = []
 

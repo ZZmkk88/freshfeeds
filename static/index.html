@@ -66,7 +66,7 @@
   <input id="lgUser" placeholder="用户名" autocomplete="username">
   <input id="lgPass" type="password" placeholder="密码" autocomplete="current-password">
   <button class="primary" onclick="doLogin()">登录</button>
-  <p style="margin-top:14px;font-size:12px">默认账号 admin / admin123，首次登录会要求改密码。</p>
+  <p style="margin-top:14px;font-size:12px">默认账号 admin / admin123，首次登录会提示改密码（可跳过）。</p>
 </div>
 
 <div id="appView">
@@ -125,7 +125,7 @@
 </dialog>
 
 <dialog id="pwDlg">
-  <h3>首次登录请改密码</h3>
+  <h3>首次登录建议改密码</h3>
   <div class="row"><input id="oldPw" type="password" placeholder="旧密码"></div>
   <div class="row"><input id="newPw" type="password" placeholder="新密码（至少 6 位）"></div>
   <div class="row" style="text-align:right"><button class="primary" onclick="changePw()">保存</button></div>
@@ -144,7 +144,11 @@ async function api(path, opts = {}) {
   if (!r.ok) throw new Error(data.detail || ('出错了 ' + r.status));
   return data;
 }
-function esc(s) { const d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
+function esc(s) {
+  return String(s || '').replace(/[&<>"']/g, function (ch) {
+    return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[ch];
+  });
+}
 function safeHref(s) { const t = (s || '').trim(); if (!/^https?:\/\//i.test(t)) return ''; return esc(t); }
 function fmtTime(s) { if (!s) return ''; const d = new Date(s); return d.toLocaleString('zh-CN', { hour12: false }); }
 
