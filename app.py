@@ -76,12 +76,19 @@ def _addr_blocked(ip) -> bool:
 def _embedded_ipv4(ip: ipaddress.IPv6Address):
     """过渡地址里夹着的 IPv4。6to4 / NAT64 / Teredo / 已废弃的 IPv4-compatible。"""
     packed = int(ip)
+    raw = ip.packed
     if ip in ipaddress.ip_network("2002::/16"):
         return ipaddress.IPv4Address((packed >> 80) & 0xFFFFFFFF)
-    if ip in ipaddress.ip_network("64:ff9b::/96") or ip in ipaddress.ip_network("64:ff9b:1::/48"):
-        return ipaddress.IPv4Address(packed & 0xFFFFFFFF)
+    if ip in ipaddress.ip_network("64:ff9b::/96"):
+        return ipaddress.IPv4Address(raw[12:16])
+    # RFC 6052：/48 的内嵌 IPv4 在第 48–87 位，中间隔一个 u 字节；最后 32 位是后缀。
+    if ip in ipaddress.ip_network("64:ff9b:1::/48"):
+        return ipaddress.IPv4Address(raw[6:8] + raw[9:11])
     if ip in ipaddress.ip_network("2001::/32"):
         return ipaddress.IPv4Address((packed & 0xFFFFFFFF) ^ 0xFFFFFFFF)
+    # RFC 2765 SIIT：::ffff:0:a.b.c.d。映射地址 ::ffff:a.b.c.d 已在调用方转成 IPv4。
+    if ip in ipaddress.ip_network("::ffff:0:0:0/96"):
+        return ipaddress.IPv4Address(packed & 0xFFFFFFFF)
     # ::ffff:0:0/96 已在调用方转成 IPv4，不会进到这里。
     if ip.ipv4_mapped is None and packed >> 32 == 0:
         return ipaddress.IPv4Address(packed & 0xFFFFFFFF)
