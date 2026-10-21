@@ -31,6 +31,7 @@ DB_PATH = os.environ.get("FRESHFEEDS_DB", os.path.join(BASE_DIR, "data", "freshf
 REFRESH_MINUTES = int(os.environ.get("FRESHFEEDS_REFRESH_MINUTES", "30"))
 SCHEDULER_ON = os.environ.get("FRESHFEEDS_SCHEDULER", "1") != "0"
 TOKEN_TTL_HOURS = 24
+MAX_PASSWORD_CHARS = 128
 USER_AGENT = "freshfeeds/1.0 (+https://github.com/ZZmkk88/freshfeeds)"
 FETCH_TIMEOUT = 15
 MAX_OPML_BYTES = 2_000_000
@@ -67,20 +68,51 @@ _BLOCKED_NETWORKS = [
 ]
 
 
+_V6_6TO4 = ipaddress.ip_network("2002::/16")
+_V6_NAT64 = ipaddress.ip_network("64:ff9b::/96")
+_V6_TEREDO = ipaddress.ip_network("2001::/32")
+_V6_COMPAT = ipaddress.ip_network("::/96")
+
+
+def _blocked_ipv4(ip: ipaddress.IPv4Address) -> bool:
+    return any(ip in net for net in _BLOCKED_NETWORKS if net.version == 4)
+
+
+def _embedded_ipv4s(ip: ipaddress.IPv6Address) -> list:
+    """拆出 6to4 / NAT64 / Teredo / IPv4 兼容地址里的 IPv4。198.18/15 不在清单里，拆出来仍放行。"""
+    if ip.ipv4_mapped is not None:
+        return [ip.ipv4_mapped]
+    raw = int(ip)
+    if ip in _V6_6TO4:
+        return [ipaddress.IPv4Address((raw >> 80) & 0xFFFFFFFF)]
+    if ip in _V6_NAT64:
+        return [ipaddress.IPv4Address(raw & 0xFFFFFFFF)]
+    if ip in _V6_TEREDO:
+        server = ipaddress.IPv4Address((raw >> 64) & 0xFFFFFFFF)
+        client = ipaddress.IPv4Address((raw & 0xFFFFFFFF) ^ 0xFFFFFFFF)
+        return [server, client]
+    if ip in _V6_COMPAT and raw != 0:
+        return [ipaddress.IPv4Address(raw & 0xFFFFFFFF)]
+    return []
+
+
 def _is_public_ip(ip_text: str) -> bool:
     try:
         ip = ipaddress.ip_address(ip_text)
     except ValueError:
         return False
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-        ip = ip.ipv4_mapped
+    if isinstance(ip, ipaddress.IPv6Address):
+        embedded = _embedded_ipv4s(ip)
+        if embedded:
+            return not any(_blocked_ipv4(item) for item in embedded)
     return not any(ip in net for net in _BLOCKED_NETWORKS if net.version == ip.version)
 
 
-def ensure_fetch_allowed(url: str) -> None:
+def ensure_fetch_allowed(url: str) -> list:
     """只允许 http(s)。主机名缺失、解析失败、或任一地址命中内网/保留网段，就拒绝。
     标准 IP 字面量直接判。ipaddress 不认、但 inet_aton 认的缩写或进制写法，
-    按解析出的 IPv4 判。其余走 DNS，任一命中即拦。解析失败也拒绝。"""
+    按解析出的 IPv4 判。其余走 DNS，任一命中即拦。解析失败也拒绝。
+    返回已通过的地址，连接时只许连这些地址。"""
     parts = urllib.parse.urlparse(url)
     if parts.scheme not in ("http", "https"):
         raise BlockedUrlError("只允许抓取 http(s) 地址")
@@ -93,6 +125,41 @@ def ensure_fetch_allowed(url: str) -> None:
     for ip_text in addresses:
         if not _is_public_ip(ip_text):
             raise BlockedUrlError(f"拒绝抓取内网/保留地址：{host}（{ip_text}）")
+    return addresses
+
+
+def _open_pinned(req, addresses):
+    """测试桩若让校验函数返回 None，则按原样连接。否则本次解析只返回这些 IP。"""
+    if not addresses:
+        return _FETCH_OPENER.open(req, timeout=FETCH_TIMEOUT)
+
+    def pinned_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        port_i = int(port)
+        infos = []
+        for ip_text in addresses:
+            ip = ipaddress.ip_address(ip_text)
+            if isinstance(ip, ipaddress.IPv6Address):
+                if family not in (0, socket.AF_INET6):
+                    continue
+                sockaddr = (ip_text, port_i, 0, 0)
+                family_af = socket.AF_INET6
+            else:
+                if family not in (0, socket.AF_INET):
+                    continue
+                sockaddr = (ip_text, port_i)
+                family_af = socket.AF_INET
+            infos.append((family_af, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", sockaddr))
+        if not infos:
+            raise socket.gaierror(socket.EAI_NONAME, "no pinned address for requested family")
+        return infos
+
+    with _pin_lock:
+        original = socket.getaddrinfo
+        socket.getaddrinfo = pinned_getaddrinfo
+        try:
+            return _FETCH_OPENER.open(req, timeout=FETCH_TIMEOUT)
+        finally:
+            socket.getaddrinfo = original
 
 
 def _addresses_for_host(host: str) -> list:
@@ -116,7 +183,12 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
-_FETCH_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+# 忽略环境代理。代理会自己解析域名，已校验的地址就不是真正连出去的地址。
+_FETCH_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}),
+    _NoRedirectHandler(),
+)
+_pin_lock = threading.Lock()
 
 from contextlib import asynccontextmanager
 
@@ -248,6 +320,8 @@ def current_user(authorization: str = Header(default="")):
 
 @app.post("/api/login")
 def login(body: LoginIn):
+    if len(body.username) > MAX_PASSWORD_CHARS or len(body.password) > MAX_PASSWORD_CHARS:
+        raise HTTPException(401, "用户名或密码不对")
     conn = db()
     row = conn.execute(
         "SELECT * FROM users WHERE username = ?", (body.username,)
@@ -281,6 +355,11 @@ def _bearer_hash(authorization: str) -> str:
 def change_password(
     body: ChangePwIn, authorization: str = Header(default=""), user=Depends(current_user)
 ):
+    if (
+        len(body.old_password) > MAX_PASSWORD_CHARS
+        or len(body.new_password) > MAX_PASSWORD_CHARS
+    ):
+        raise HTTPException(400, "密码过长")
     if len(body.new_password) < 6:
         raise HTTPException(400, "新密码至少 6 位")
     conn = db()
@@ -322,14 +401,14 @@ def fetch_url(url: str, etag: str = "", last_modified: str = ""):
     重定向自己跟，每一跳都过 SSRF 校验；响应体超过 5MB 拒绝。"""
     current = url
     for _ in range(MAX_REDIRECTS + 1):
-        ensure_fetch_allowed(current)
+        pinned = ensure_fetch_allowed(current)
         req = urllib.request.Request(current, headers={"User-Agent": USER_AGENT})
         if etag and current == url:
             req.add_header("If-None-Match", etag)
         if last_modified and current == url:
             req.add_header("If-Modified-Since", last_modified)
         try:
-            resp = _FETCH_OPENER.open(req, timeout=FETCH_TIMEOUT)
+            resp = _open_pinned(req, pinned if isinstance(pinned, list) else None)
         except urllib.error.HTTPError as exc:
             if exc.code == 304:
                 return ("not_modified", "", etag, last_modified, "")
